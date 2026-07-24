@@ -5,6 +5,8 @@ out/**
 node_modules/**
 .gitignore
 .yarnrc
+.nvmrc
+.vscode-test.mjs
 esbuild.js
 eslint.config.mjs
 tsconfig.json

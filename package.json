@@ -4,8 +4,12 @@
   "description": "Develop applications on the Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
   "version": "0.0.1",
   "publisher": "webwiseAU",
-  "private": true,
-  "license": "UNLICENSED",
+  "private": false,
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brendonupson/PuakmaVortexVSCode.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },

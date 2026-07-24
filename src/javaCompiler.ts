@@ -1,0 +1,315 @@
+import * as vscode from "vscode";
+import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { TornadoClient } from "./tornadoClient";
+import { DEV_CONFIG_RELATIVE_PATH, readDevConfig } from "./designSync";
+
+const execFileAsync = promisify(execFile);
+
+// Actions/SharedCode/ScheduledActions can reference each other, so they're
+// compiled together in one invocation rather than per-file — matches how
+// the reference tool (vortex-cli-mirror's compile.py) does it, for the
+// same reason.
+const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"];
+
+// A single -d flag needs one shared output root regardless of which of the
+// three folders a source came from — so compiled classes land here, not
+// next to their .java. This is also why the watcher never needs to know
+// about it: "zbin" isn't a recognised design-type folder, so it's silently
+// skipped by handleCreate's existing unrecognised-folder check.
+export const COMPILE_OUTPUT_FOLDER = "zbin";
+
+const SERVER_LIB_FOLDER = ".lib"; // sits alongside app folders, directly under .tornado/
+const SYSTEM_JAR_FILENAME = "puakma.jar";
+const LIBRARIES_ZIP_FILENAME = "libraries.zip";
+const LIBRARIES_EXTRACT_FOLDER = "libraries";
+
+// Compiling with ecj (the Eclipse Compiler for Java — literally the
+// compiler Eclipse's own IDE runs internally) rather than javac: with
+// -proceedOnError it keeps generating .class output for everything else
+// even when a source has real errors, or an entirely unresolved import,
+// embedding a stub that only throws at runtime if the broken part is
+// actually reached — recreating the "keep working despite errors" model
+// Eclipse workspaces have. javac instead sometimes discards output for the
+// *whole* batch over one broken file (confirmed empirically — an
+// unresolved import is enough), which previously needed an exclude-and-
+// retry workaround; ecj's own error recovery makes that unnecessary.
+// Pinned to a known-good version rather than "latest" for reproducibility,
+// downloaded once from Maven Central (EPL-licensed, fine to fetch
+// directly) into the extension's cross-workspace global storage, since
+// it's a dev tool, not tied to any one server connection or workspace.
+const ECJ_VERSION = "3.46.0";
+const ECJ_JAR_FILENAME = `ecj-${ECJ_VERSION}.jar`;
+const ECJ_DOWNLOAD_URL = `https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/${ECJ_VERSION}/${ECJ_JAR_FILENAME}`;
+
+function findJava(): string {
+  const configured = vscode.workspace.getConfiguration("tornado").get<string>("javaHome", "");
+  const javaHome = configured || process.env.JAVA_HOME;
+  if (javaHome) {
+    return path.join(javaHome, "bin", process.platform === "win32" ? "java.exe" : "java");
+  }
+  // Resolved via PATH by execFile if not found via a configured/env JAVA_HOME.
+  return "java";
+}
+
+async function exists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findJarsRecursive(dir: vscode.Uri): Promise<string[]> {
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return [];
+  }
+  const results: string[] = [];
+  for (const [name, type] of entries) {
+    const childUri = vscode.Uri.joinPath(dir, name);
+    if (type === vscode.FileType.Directory) {
+      results.push(...(await findJarsRecursive(childUri)));
+    } else if (type === vscode.FileType.File && name.endsWith(".jar")) {
+      results.push(childUri.fsPath);
+    }
+  }
+  return results;
+}
+
+async function extractLibrariesZip(zipUri: vscode.Uri, destDir: vscode.Uri): Promise<void> {
+  await vscode.workspace.fs.createDirectory(destDir);
+  try {
+    // The zip's members are jar files themselves, not classes — javac can
+    // treat a single jar/zip as a classpath entry, but not a zip-of-jars,
+    // so this has to actually unpack. Shells out to the system "unzip"
+    // rather than hand-rolling a zip reader or adding a dependency for it.
+    await execFileAsync("unzip", ["-o", zipUri.fsPath, "-d", destDir.fsPath]);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error(
+        `Could not find "unzip" to extract the server's ${LIBRARIES_ZIP_FILENAME}. Extract it ` +
+          `manually into "${destDir.fsPath}" and try compiling again.`,
+      );
+    }
+    throw new Error(`Failed to extract ${LIBRARIES_ZIP_FILENAME}: ${(error as Error).message}`);
+  }
+}
+
+// Downloads (or reuses a locally cached copy of) the server's own
+// puakma.jar and shared-library jars via GET /vortex/systemjar and
+// GET /vortex/libraries, so Java design elements are compiled against
+// exactly the classes the server runs. Cached per-connection under
+// .tornado/.lib/<connectionId>/, since these are server-wide rather than
+// per-app. Pass forceRefresh after a server-side upgrade to re-download.
+export async function ensureServerLibraries(
+  tornadoRoot: vscode.Uri,
+  connectionId: string,
+  client: TornadoClient,
+  output: vscode.OutputChannel,
+  forceRefresh = false,
+): Promise<string[]> {
+  const libDir = vscode.Uri.joinPath(tornadoRoot, SERVER_LIB_FOLDER, connectionId);
+  await vscode.workspace.fs.createDirectory(libDir);
+
+  const systemJarUri = vscode.Uri.joinPath(libDir, SYSTEM_JAR_FILENAME);
+  if (forceRefresh || !(await exists(systemJarUri))) {
+    output.appendLine("Downloading puakma.jar from the server (GET /vortex/systemjar)...");
+    const bytes = await client.downloadSystemJar();
+    await vscode.workspace.fs.writeFile(systemJarUri, new Uint8Array(bytes));
+    output.appendLine(`  saved ${systemJarUri.fsPath}`);
+  }
+
+  const librariesZipUri = vscode.Uri.joinPath(libDir, LIBRARIES_ZIP_FILENAME);
+  const librariesDir = vscode.Uri.joinPath(libDir, LIBRARIES_EXTRACT_FOLDER);
+  let libraryJars = await findJarsRecursive(librariesDir);
+  if (forceRefresh || !(await exists(librariesZipUri)) || libraryJars.length === 0) {
+    output.appendLine("Downloading shared libraries from the server (GET /vortex/libraries)...");
+    const bytes = await client.downloadLibraries();
+    await vscode.workspace.fs.writeFile(librariesZipUri, new Uint8Array(bytes));
+    output.appendLine(`  saved ${librariesZipUri.fsPath}, extracting...`);
+    await extractLibrariesZip(librariesZipUri, librariesDir);
+    libraryJars = await findJarsRecursive(librariesDir);
+    output.appendLine(`  ${libraryJars.length} jar(s) extracted`);
+  }
+
+  return [systemJarUri.fsPath, ...libraryJars];
+}
+
+// Downloads (or reuses a cached copy of) the ecj batch compiler jar into
+// the extension's global storage — shared across every workspace and app,
+// since it's a dev tool rather than something server- or app-specific.
+export async function ensureEcj(globalStorageUri: vscode.Uri, output: vscode.OutputChannel): Promise<string> {
+  const jarUri = vscode.Uri.joinPath(globalStorageUri, "ecj", ECJ_JAR_FILENAME);
+  if (await exists(jarUri)) {
+    return jarUri.fsPath;
+  }
+  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(globalStorageUri, "ecj"));
+  output.appendLine(`Downloading the Eclipse Compiler for Java (ecj ${ECJ_VERSION})...`);
+  const response = await fetch(ECJ_DOWNLOAD_URL);
+  if (!response.ok) {
+    throw new Error(`Failed to download ecj from ${ECJ_DOWNLOAD_URL}: ${response.status} ${response.statusText}`);
+  }
+  const bytes = await response.arrayBuffer();
+  await vscode.workspace.fs.writeFile(jarUri, new Uint8Array(bytes));
+  output.appendLine(`  saved ${jarUri.fsPath} (${bytes.byteLength} bytes)`);
+  return jarUri.fsPath;
+}
+
+export interface CompileResult {
+  classFiles: vscode.Uri[]; // top-level only — nested/inner classes are filtered out (see below) and can't be deployed
+  hadErrors: boolean; // true if ecj reported errors — classFiles may still include stub classes for the affected sources (see compileApp)
+  failedSourceNames: string[]; // base names (no extension) of sources that produced no class at all, even as a stub
+}
+
+export async function compileApp(
+  appFolder: vscode.Uri,
+  connectionId: string,
+  client: TornadoClient,
+  globalStorageUri: vscode.Uri,
+  output: vscode.OutputChannel,
+): Promise<CompileResult | undefined> {
+  const sourceFiles: string[] = [];
+  for (const folder of JAVA_SOURCE_FOLDERS) {
+    const dirUri = vscode.Uri.joinPath(appFolder, folder);
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dirUri);
+    } catch {
+      continue;
+    }
+    for (const [name, type] of entries) {
+      if (type === vscode.FileType.File && name.endsWith(".java")) {
+        sourceFiles.push(vscode.Uri.joinPath(dirUri, name).fsPath);
+      }
+    }
+  }
+  if (sourceFiles.length === 0) {
+    output.appendLine("No .java sources found to compile.");
+    return undefined;
+  }
+
+  // appFolder is .tornado/<connectionName>_<appgroup>_<appname>/, so its
+  // parent is .tornado/ itself — where the shared per-connection lib cache
+  // lives, alongside (not inside) any particular app's folder.
+  const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
+  const serverClasspath = await ensureServerLibraries(tornadoRoot, connectionId, client, output);
+  const extraClasspath = vscode.workspace.getConfiguration("tornado").get<string[]>("compileClasspath", []);
+  const classpath = [...serverClasspath, ...extraClasspath];
+
+  const outDir = vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER);
+  // Cleared before every run rather than just created-if-missing: javac
+  // doesn't delete a source's old .class output just because recompiling
+  // that source failed this time, so a stale outDir could otherwise leave
+  // last run's class sitting there and get mistaken for a fresh success —
+  // uploading unchanged bytecode for a source that's now actually broken.
+  try {
+    await vscode.workspace.fs.delete(outDir, { recursive: true, useTrash: false });
+  } catch {
+    // Didn't exist yet — fine, this is the first compile of this app.
+  }
+  await vscode.workspace.fs.createDirectory(outDir);
+
+  // Documentation/devconfig.json (created on sync, see designSync.ts) is the
+  // per-app override — falls back to the global setting if it's missing or
+  // doesn't specify one.
+  const devConfig = await readDevConfig(appFolder);
+  const release =
+    devConfig?.javaVersion ||
+    vscode.workspace.getConfiguration("tornado").get<string>("javaRelease", "8");
+  if (devConfig?.javaVersion) {
+    output.appendLine(`Using javaVersion "${devConfig.javaVersion}" from ${DEV_CONFIG_RELATIVE_PATH}.`);
+  }
+  const ecjJar = await ensureEcj(globalStorageUri, output);
+  const java = findJava();
+  const args = [
+    "-jar",
+    ecjJar,
+    "-d",
+    outDir.fsPath,
+    "-cp",
+    classpath.join(path.delimiter),
+    "--release",
+    release,
+    "-proceedOnError",
+    ...sourceFiles,
+  ];
+
+  output.appendLine(`→ ${java} ${args.join(" ")}`);
+  let hadErrors = false;
+  try {
+    const { stdout, stderr } = await execFileAsync(java, args);
+    if (stdout.trim()) {
+      output.appendLine(stdout);
+    }
+    if (stderr.trim()) {
+      output.appendLine(stderr);
+    }
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+    if (err.stdout?.trim()) {
+      output.appendLine(err.stdout);
+    }
+    if (err.stderr?.trim()) {
+      output.appendLine(err.stderr);
+    }
+    if (err.code === "ENOENT") {
+      throw new Error(
+        `Could not find java ("${java}"). Set "tornado.javaHome" to a JDK's home directory, ` +
+          'ensure $JAVA_HOME is set, or make sure "java" is on your PATH.',
+      );
+    }
+    // -proceedOnError means ecj still writes .class output (with a
+    // runtime-throwing stub in place of whatever's actually broken) for
+    // every source it can, rather than discarding the whole batch's output
+    // the way javac can over a single unresolved import — a non-zero exit
+    // here just means errors were reported, not that nothing compiled.
+    // What's actually sitting in outDir below reflects that.
+    hadErrors = true;
+    output.appendLine(
+      "ecj reported errors (above) — proceeding anyway (-proceedOnError): the class(es) for the " +
+        "affected source(s) may throw at runtime if the broken part is actually reached.",
+    );
+  }
+
+  const compiled = await vscode.workspace.fs.readDirectory(outDir);
+  const classFiles: vscode.Uri[] = [];
+  const nested: string[] = [];
+  for (const [name, type] of compiled) {
+    if (type !== vscode.FileType.File || !name.endsWith(".class")) {
+      continue;
+    }
+    if (name.includes("$")) {
+      // Nested/inner/anonymous classes — Puakma can't deploy these as
+      // design elements (there's no design element for them to map to).
+      nested.push(name);
+      continue;
+    }
+    classFiles.push(vscode.Uri.joinPath(outDir, name));
+  }
+  if (nested.length > 0) {
+    output.appendLine(
+      `Warning: nested/inner/anonymous classes compiled (${nested.join(", ")}) — these cannot ` +
+        "be deployed as design elements; refactor to top-level classes if you need them uploaded.",
+    );
+  }
+
+  const compiledNames = new Set(classFiles.map((uri) => path.basename(uri.fsPath, ".class")));
+  const failedSourceNames = sourceFiles
+    .map((file) => path.basename(file, ".java"))
+    .filter((name) => !compiledNames.has(name));
+
+  output.appendLine(
+    `Compiled ${classFiles.length} top-level class(es)` +
+      (failedSourceNames.length > 0
+        ? `, ${failedSourceNames.length} produced no output at all (not even a stub): ${failedSourceNames.join(", ")}`
+        : "") +
+      ".",
+  );
+  return { classFiles, hadErrors, failedSourceNames };
+}

@@ -1,0 +1,208 @@
+{
+  "name": "tornado-vscode",
+  "displayName": "Tornado Extension",
+  "description": "Develop applications on the Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
+  "version": "0.0.1",
+  "publisher": "webwiseAU",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "media/icon.png",
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tornado.addConnection",
+        "title": "Tornado: Add Connection",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tornado.selectConnection",
+        "title": "Tornado: Select Connection",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "tornado.editConnection",
+        "title": "Tornado: Edit Connection",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "tornado.deleteConnection",
+        "title": "Tornado: Delete Connection",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tornado.refreshInventory",
+        "title": "Tornado: Refresh Inventory",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "tornado.syncApplication",
+        "title": "Tornado: Sync Application to Workspace"
+      },
+      {
+        "command": "tornado.startWatching",
+        "title": "Tornado: Start Watching Application"
+      },
+      {
+        "command": "tornado.stopWatching",
+        "title": "Tornado: Stop Watching Application"
+      },
+      {
+        "command": "tornado.refreshFromServer",
+        "title": "Tornado: Refresh from Server",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "tornado.compileAndUpload",
+        "title": "Tornado: Compile & Upload Java"
+      },
+      {
+        "command": "tornado.refreshServerLibraries",
+        "title": "Tornado: Refresh Server Libraries"
+      }
+    ],
+    "configuration": {
+      "title": "Tornado",
+      "properties": {
+        "tornado.connections": {
+          "type": "array",
+          "default": [],
+          "description": "Configured Tornado server connections. Usernames and passwords are not stored here — they live in secure storage (SecretStorage), keyed by each connection's id.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable identifier, generated when the connection is added. Do not edit by hand."
+              },
+              "name": {
+                "type": "string",
+                "description": "Display name for this connection, e.g. Dev, Staging or Production."
+              },
+              "serverUrl": {
+                "type": "string",
+                "description": "Base URL of the Tornado application server, e.g. https://tornado.example.com/system/webdesign.pma"
+              }
+            },
+            "required": ["id", "name", "serverUrl"]
+          }
+        },
+        "tornado.javaHome": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a JDK/JRE home directory, used to find the java launcher that runs the ecj compiler for Java design elements (Actions/SharedCode/ScheduledActions). Falls back to $JAVA_HOME, then java on PATH, if empty."
+        },
+        "tornado.javaRelease": {
+          "type": "string",
+          "default": "8",
+          "description": "Target Java bytecode version (ecj's --release flag) so compiled classes match what your Tornado server can load. Adjust if compilation fails with an unsupported --release error, or if uploaded classes fail to load on the server."
+        },
+        "tornado.compileClasspath": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Optional extra jar/directory paths to add to the Java compile classpath, beyond the server's own puakma.jar and shared libraries (downloaded automatically via /vortex/systemjar and /vortex/libraries)."
+        },
+        "tornado.compileOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a watched application's .java file (Actions/SharedCode/ScheduledActions) is saved, automatically compile the whole application's Java and upload the resulting classes. Disable if this feels too eager (e.g. compiling on every save while iterating)."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tornado",
+          "title": "Tornado",
+          "icon": "media/tornado-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tornado": [
+        {
+          "id": "tornadoInventory",
+          "name": "Inventory"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "tornadoInventory",
+        "contents": "No connection configured.\n[Add Connection](command:tornado.addConnection)",
+        "when": "tornado.hasConnections == false"
+      },
+      {
+        "view": "tornadoInventory",
+        "contents": "No connection selected.\n[Select Connection](command:tornado.selectConnection)",
+        "when": "tornado.hasConnections && !tornado.hasActiveConnection"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "tornado.refreshInventory",
+          "when": "view == tornadoInventory",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tornado.selectConnection",
+          "when": "view == tornadoInventory",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tornado.addConnection",
+          "when": "view == tornadoInventory",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tornado.editConnection",
+          "when": "view == tornadoInventory",
+          "group": "1_connections@1"
+        },
+        {
+          "command": "tornado.deleteConnection",
+          "when": "view == tornadoInventory",
+          "group": "1_connections@2"
+        },
+        {
+          "command": "tornado.refreshFromServer",
+          "when": "view == workbench.explorer.fileView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch",
+    "check-types": "tsc --noEmit",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.x",
+    "@types/mocha": "^10.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0",
+    "eslint": "^9.0.0",
+    "esbuild": "^0.23.0",
+    "npm-run-all2": "^6.2.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.0"
+  }
+}

@@ -8,10 +8,28 @@ import {
   setActiveConnectionId,
   updateConnection,
 } from "./config";
-import { DesignElementPayload, InventoryItem, TornadoClient } from "./tornadoClient";
+import {
+  DesignElementPayload,
+  NewApplicationPayload,
+  NewDesignElementPayload,
+  InventoryItem,
+  TornadoClient,
+} from "./tornadoClient";
 import { INHERITED_APP_URI_SCHEME, InventoryTreeProvider } from "./inventoryTreeProvider";
-import { ensureDesignElementFolder } from "./workspaceStorage";
-import { DesignSyncResult, readManifest, writeDesignElements } from "./designSync";
+import { assertSafePathSegment, ensureDesignElementFolder, folderName } from "./workspaceStorage";
+import {
+  DesignSyncResult,
+  DEV_CONFIG_RELATIVE_PATH,
+  Manifest,
+  ManifestEntry,
+  extensionFor,
+  inferContentType,
+  isNestedJavaClassName,
+  readManifest,
+  useSourceField,
+  writeDesignElements,
+  writeManifestFile,
+} from "./designSync";
 import { AppWatcher } from "./appWatcher";
 import { compileApp, ensureServerLibraries } from "./javaCompiler";
 import { ensureJavaIntelliSense } from "./javaIntellisense";
@@ -200,6 +218,73 @@ async function compileAndUploadFolder(
     uploaded++;
   }
 
+  // Nested/inner/anonymous classes (e.g. Foo$Bar.class) have no .java of
+  // their own to match a manifest entry by name — they're deployed as
+  // SharedCode (designtype 4), created on the server the first time each
+  // one is seen and updated in place on every compile after that.
+  let manifestChanged = false;
+  for (const classFileUri of result.nestedClassFiles) {
+    const fileName = classFileUri.path.split("/").pop() ?? "";
+    const className = fileName.replace(/\.class$/, "");
+    const classBytes = await vscode.workspace.fs.readFile(classFileUri);
+    const designdata = Buffer.from(classBytes).toString("base64");
+
+    const entry = manifest.elements.find((e) => e.name === className && e.designtype === 4);
+    if (entry) {
+      const payload: DesignElementPayload = {
+        designbucketid: entry.designbucketid,
+        appid: manifest.appid,
+        name: entry.name,
+        designtype: entry.designtype,
+        contenttype: entry.contenttype,
+        designdata,
+        designsource: "",
+        inheritfrom: entry.inheritfrom,
+        comment: entry.comment,
+        options: entry.options,
+        designparams: entry.designparams,
+      };
+      await client.updateDesignElement(manifest.appid, entry.designbucketid, payload);
+      output.appendLine(`Uploaded compiled nested class "${className}" (${classBytes.length} bytes).`);
+      uploaded++;
+      continue;
+    }
+
+    const contenttype = inferContentType(4, ".java");
+    const newPayload: NewDesignElementPayload = {
+      appid: manifest.appid,
+      name: className,
+      designtype: 4,
+      contenttype,
+      designdata,
+      designsource: "",
+      inheritfrom: null,
+      comment: "",
+      options: "",
+      designparams: [],
+    };
+    const created = await client.createDesignElement(manifest.appid, newPayload);
+    manifest.elements.push({
+      path: `SharedCode/${created.name}.class`,
+      designbucketid: created.designbucketid,
+      name: created.name,
+      designtype: created.designtype,
+      contenttype: created.contenttype,
+      inheritfrom: created.inheritfrom,
+      comment: created.comment,
+      options: created.options,
+      designparams: created.designparams,
+    });
+    manifestChanged = true;
+    output.appendLine(
+      `Created nested class "${className}" as a new SharedCode design element (id ${created.designbucketid}).`,
+    );
+    uploaded++;
+  }
+  if (manifestChanged) {
+    await writeManifestFile(folder, manifest);
+  }
+
   return { uploaded, skipped, hadErrors: result.hadErrors, failedSourceNames: result.failedSourceNames };
 }
 
@@ -221,6 +306,86 @@ function formatCompileSummary(result: CompileAndUploadSummary): string {
   }
   return parts.join("; ");
 }
+
+interface EditableFieldDef<K extends string> {
+  key: K;
+  label: string;
+  prompt: string;
+}
+
+interface PropertyQuickPickItem<K extends string> extends vscode.QuickPickItem {
+  action: "edit" | "save" | "cancel";
+  field?: K;
+}
+
+// Shared by tornado.editDesignElementProperties and
+// tornado.editApplicationProperties: a QuickPick listing each editable
+// string field alongside its current value, letting the user open an input
+// box for one field at a time and loop back until Save or Cancel. Returns
+// only the fields actually changed, or undefined if cancelled without
+// saving (including a plain Escape out of the QuickPick itself).
+async function editPropertiesViaQuickPick<K extends string>(
+  title: string,
+  fields: EditableFieldDef<K>[],
+  currentValueOf: (key: K) => string,
+): Promise<Partial<Record<K, string>> | undefined> {
+  const edits: Partial<Record<K, string>> = {};
+  const valueOf = (key: K): string => edits[key] ?? currentValueOf(key);
+
+  while (true) {
+    const items: PropertyQuickPickItem<K>[] = [
+      ...fields.map((field) => ({
+        label: field.label,
+        description: valueOf(field.key) || "(empty)",
+        action: "edit" as const,
+        field: field.key,
+      })),
+      { label: "$(check) Save Changes", action: "save" as const },
+      { label: "$(x) Cancel Without Saving", action: "cancel" as const },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title,
+      placeHolder: "Select a property to edit",
+      ignoreFocusOut: true,
+    });
+    if (!picked || picked.action === "cancel") {
+      return undefined;
+    }
+    if (picked.action === "save") {
+      return edits;
+    }
+    const field = fields.find((f) => f.key === picked.field)!;
+    const newValue = await vscode.window.showInputBox({
+      prompt: field.prompt,
+      value: valueOf(field.key),
+      ignoreFocusOut: true,
+    });
+    if (newValue === undefined) {
+      continue;
+    }
+    edits[field.key] = newValue;
+  }
+}
+
+// Shared by tornado.createApplication and tornado.editApplicationProperties
+// — appdisplayname/appversion are deliberately excluded (read-only,
+// server/tooling-managed rather than something meant to be hand-edited here).
+type ApplicationPropertyField = "appname" | "appgroup" | "description" | "templatename" | "inheritfrom";
+const APPLICATION_PROPERTY_FIELDS: EditableFieldDef<ApplicationPropertyField>[] = [
+  { key: "appname", label: "App Name", prompt: "Application name" },
+  { key: "appgroup", label: "App Group", prompt: "Application group, or leave empty for none" },
+  { key: "description", label: "Description", prompt: "Description" },
+  {
+    key: "templatename",
+    label: "Template Name",
+    prompt: "Template name, or leave empty if this application isn't a template",
+  },
+  {
+    key: "inheritfrom",
+    label: "Inherit From",
+    prompt: "Name of the application to inherit from, or leave empty for none",
+  },
+];
 
 // Shared by tornado.startWatching and tornado.refreshFromServer: lets the
 // user pick one of the applications already synced into this workspace.
@@ -246,6 +411,40 @@ async function pickSyncedAppFolder(placeHolder: string): Promise<vscode.Uri | un
     { placeHolder },
   );
   return picked?.folder;
+}
+
+// Given a file open in the editor (or right-clicked in the Explorer), walks
+// up its ancestors looking for a synced app's manifest — a design element's
+// path is always exactly two levels under its app folder (<DesignTypeFolder>/
+// <file>), but walking rather than hardcoding that depth means this keeps
+// working if that ever changes. devconfig.json lives inside Documentation/
+// like a real design element but is dev tooling, not one — see designSync.ts
+// — so it's explicitly excluded rather than "found" with no matching entry.
+async function locateManifestEntry(
+  uri: vscode.Uri,
+): Promise<{ appFolder: vscode.Uri; manifest: Manifest; entry: ManifestEntry } | undefined> {
+  let dir = vscode.Uri.joinPath(uri, "..");
+  for (let i = 0; i < 8; i++) {
+    const manifest = await readManifest(dir);
+    if (manifest) {
+      const base = dir.path.endsWith("/") ? dir.path : `${dir.path}/`;
+      if (!uri.path.startsWith(base)) {
+        return undefined;
+      }
+      const relativePath = uri.path.slice(base.length);
+      if (relativePath === DEV_CONFIG_RELATIVE_PATH) {
+        return undefined;
+      }
+      const entry = manifest.elements.find((e) => e.path === relativePath);
+      return entry ? { appFolder: dir, manifest, entry } : undefined;
+    }
+    const parent = vscode.Uri.joinPath(dir, "..");
+    if (parent.path === dir.path) {
+      return undefined;
+    }
+    dir = parent;
+  }
+  return undefined;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -596,6 +795,113 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("tornado.createApplication", async () => {
+      const connection = getActiveConnection(context);
+      if (!connection) {
+        vscode.window.showErrorMessage(
+          "No active Tornado connection. Run 'Tornado: Add Connection' or 'Tornado: Select Connection' first.",
+        );
+        return;
+      }
+      if (!vscode.workspace.workspaceFolders?.length) {
+        const openFolder = "Open Folder...";
+        const choice = await vscode.window.showErrorMessage(
+          "Open a workspace folder before creating a Tornado application.",
+          openFolder,
+        );
+        if (choice === openFolder) {
+          await vscode.commands.executeCommand("vscode.openFolder");
+        }
+        return;
+      }
+
+      const edits = await editPropertiesViaQuickPick(
+        "Create Application",
+        APPLICATION_PROPERTY_FIELDS,
+        () => "",
+      );
+      if (!edits) {
+        return;
+      }
+
+      const appname = (edits.appname ?? "").trim();
+      const appgroup = (edits.appgroup ?? "").trim();
+      try {
+        // Same guard ensureDesignElementFolder applies on sync — appname/
+        // appgroup double as local folder-name segments (see folderName()
+        // in workspaceStorage.ts).
+        assertSafePathSegment(appname, "app name");
+        if (appgroup) {
+          assertSafePathSegment(appgroup, "app group");
+        }
+      } catch (error) {
+        vscode.window.showErrorMessage((error as Error).message);
+        return;
+      }
+
+      const payload: NewApplicationPayload = {
+        appname,
+        appdisplayname: "",
+        appgroup,
+        description: edits.description ?? "",
+        templatename: edits.templatename ?? "",
+        appversion: "",
+        inheritfrom: edits.inheritfrom ?? "",
+      };
+
+      let created: InventoryItem;
+      try {
+        const { client } = await buildClientForConnection(context, output, connection.id);
+        created = await client.createApplication(payload);
+      } catch (error) {
+        output.appendLine(`Failed to create application: ${(error as Error).message}`);
+        output.show(true);
+        vscode.window.showErrorMessage((error as Error).message);
+        return;
+      }
+
+      // The application now exists on the server no matter what happens
+      // below — refresh the tree and never again report failure as "Failed
+      // to create application" past this point, or a user who sees that
+      // message (e.g. from the sync leg failing) could reasonably re-run
+      // this command and create a duplicate.
+      output.appendLine(`Created application "${created.appname}" (id ${created.appid}) on the server.`);
+      treeProvider.refresh();
+
+      try {
+        const folder = await ensureDesignElementFolder(connection.name, created);
+        const result = await syncDesignToFolder(
+          context,
+          output,
+          activeWatchers,
+          folder,
+          created.appid,
+          connection.id,
+        );
+
+        const startWatchingAction = "Start Watching";
+        const choice = await vscode.window.showInformationMessage(
+          `Created "${created.appname}" on the Tornado server and synced ${result.written} design ` +
+            `element(s) to ${folder.fsPath}`,
+          startWatchingAction,
+        );
+        if (choice === startWatchingAction) {
+          await startWatchingFolder(context, output, activeWatchers, folder);
+          vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
+        }
+      } catch (error) {
+        output.appendLine(`Local sync of the new application failed: ${(error as Error).message}`);
+        output.show(true);
+        vscode.window.showWarningMessage(
+          `Created "${created.appname}" (id ${created.appid}) on the Tornado server, but syncing it ` +
+            `locally failed: ${(error as Error).message} — select it in the Inventory tree to sync it. ` +
+            "Do not re-run Create Application for it.",
+        );
+      }
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("tornado.startWatching", async () => {
       const folder = await pickSyncedAppFolder("Select a synced application to watch");
       if (!folder) {
@@ -732,6 +1038,306 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.showErrorMessage((error as Error).message);
       }
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "tornado.editDesignElementProperties",
+      async (uri?: vscode.Uri) => {
+        const targetUri = uri ?? vscode.window.activeTextEditor?.document.uri;
+        if (!targetUri) {
+          vscode.window.showErrorMessage("Open or right-click a synced design element file first.");
+          return;
+        }
+
+        const located = await locateManifestEntry(targetUri);
+        if (!located) {
+          vscode.window.showErrorMessage(`"${targetUri.fsPath}" isn't a tracked Tornado design element.`);
+          return;
+        }
+        const { appFolder, manifest, entry } = located;
+
+        type EditableField = "name" | "comment" | "options" | "inheritfrom";
+        const fields: EditableFieldDef<EditableField>[] = [
+          { key: "name", label: "Name", prompt: "Design element name" },
+          { key: "comment", label: "Comment", prompt: "Comment" },
+          { key: "options", label: "Options", prompt: "Options" },
+          {
+            key: "inheritfrom",
+            label: "Inherit From",
+            prompt: "Name of the design element to inherit from, or leave empty for none",
+          },
+        ];
+        const edits = await editPropertiesViaQuickPick(`Edit properties of "${entry.name}"`, fields, (key) =>
+          key === "inheritfrom" ? entry.inheritfrom ?? "" : entry[key],
+        );
+        if (!edits || Object.keys(edits).length === 0) {
+          return;
+        }
+
+        const oldName = entry.name;
+        const oldPath = entry.path;
+        const newName = (edits.name ?? oldName).trim();
+        try {
+          assertSafePathSegment(newName, "design element name");
+        } catch (error) {
+          vscode.window.showErrorMessage((error as Error).message);
+          return;
+        }
+        if (
+          newName !== oldName &&
+          manifest.elements.some((e) => e !== entry && e.designtype === entry.designtype && e.name === newName)
+        ) {
+          vscode.window.showErrorMessage(
+            `Another design element named "${newName}" already exists in this application.`,
+          );
+          return;
+        }
+        // A nested/inner/anonymous class's name is fixed by its enclosing
+        // top-level class (compileAndUploadFolder recreates it under that
+        // exact name on every compile) — renaming it here would just leave
+        // the renamed copy orphaned on the server once "Compile & Upload
+        // Java" recreates "Foo$Bar" from scratch.
+        if (newName !== oldName && isNestedJavaClassName(entry.designtype, oldName)) {
+          vscode.window.showErrorMessage(
+            `"${oldName}" is a nested/inner/anonymous class — its name is fixed by its enclosing ` +
+              "class and can't be changed here.",
+          );
+          return;
+        }
+
+        const newComment = edits.comment ?? entry.comment;
+        const newOptions = edits.options ?? entry.options;
+        const newInheritFrom =
+          edits.inheritfrom !== undefined ? edits.inheritfrom.trim() || null : entry.inheritfrom;
+
+        try {
+          const { client } = await buildClientForConnection(context, output, manifest.connectionId);
+          // Only name/comment/options/inheritfrom are meant to change here —
+          // designdata/designsource/contenttype/designparams are re-sent
+          // exactly as the server currently has them, fetched fresh rather
+          // than reconstructed from the local file: for Java design types
+          // the on-disk file is source text, not designdata's compiled
+          // bytecode, so guessing content from local bytes risks
+          // clobbering it.
+          const design = await client.fetchApplicationDesign(manifest.appid);
+          const current = design.designelements.find((e) => e.designbucketid === entry.designbucketid);
+          if (!current) {
+            throw new Error(
+              `"${oldName}" (id ${entry.designbucketid}) no longer exists on the server — refresh the application.`,
+            );
+          }
+
+          const payload: DesignElementPayload = {
+            designbucketid: current.designbucketid,
+            appid: current.appid,
+            name: newName,
+            designtype: current.designtype,
+            contenttype: current.contenttype,
+            designdata: current.designdata,
+            designsource: current.designsource,
+            inheritfrom: newInheritFrom,
+            comment: newComment,
+            options: newOptions,
+            designparams: current.designparams,
+          };
+          // Renaming an element by sending a changed "name" in the PUT
+          // body is assumed to actually rename it server-side, not just be
+          // ignored — every other caller of updateDesignElement always
+          // re-sends the existing name unchanged, so this is unverified
+          // against a real request (same caveat as createDesignElement's
+          // response-shape assumption in tornadoClient.ts). If the server
+          // treats "name" as immutable on PUT, this call silently
+          // succeeds while not actually renaming anything server-side,
+          // and the local rename below would then desync from it.
+          await client.updateDesignElement(manifest.appid, entry.designbucketid, payload);
+
+          entry.name = newName;
+          entry.comment = newComment;
+          entry.options = newOptions;
+          entry.inheritfrom = newInheritFrom;
+
+          const existingWatcher = activeWatchers.get(appFolder.toString());
+          if (newName !== oldName) {
+            // Same computation writeDesignElements uses for the download
+            // direction (folder + name + extensionFor, or ".class" for a
+            // nested Java class) — keeps the local filename in sync with
+            // what the next refresh-from-server would produce anyway.
+            const folderPart = oldPath.slice(0, oldPath.lastIndexOf("/"));
+            const nestedClass = isNestedJavaClassName(entry.designtype, newName);
+            const newFileName = nestedClass
+              ? `${newName}.class`
+              : `${newName}${extensionFor(entry.designtype, entry.contenttype)}`;
+            const newPath = `${folderPart}/${newFileName}`;
+            entry.path = newPath;
+
+            const oldUri = vscode.Uri.joinPath(appFolder, oldPath);
+            const newUri = vscode.Uri.joinPath(appFolder, newPath);
+            const renameEdit = new vscode.WorkspaceEdit();
+            renameEdit.renameFile(oldUri, newUri, { overwrite: false });
+            // Goes through a WorkspaceEdit rather than workspace.fs.rename
+            // so any editor with the old file open follows the rename —
+            // and is suppressed on the app's watcher (if running) so the
+            // underlying delete+create filesystem events it fires aren't
+            // mistaken for a real local delete followed by a new file.
+            const renamed = existingWatcher
+              ? await existingWatcher.runSuppressed(() => Promise.resolve(vscode.workspace.applyEdit(renameEdit)))
+              : await vscode.workspace.applyEdit(renameEdit);
+            if (!renamed) {
+              throw new Error(
+                `Renamed "${oldName}" to "${newName}" on the server, but failed to rename the local ` +
+                  `file from "${oldPath}" to "${newPath}" (target may already exist). Run "Tornado: ` +
+                  'Refresh from Server" to bring the local copy back in sync with the new name.',
+              );
+            }
+          }
+
+          await writeManifestFile(appFolder, manifest);
+          if (existingWatcher) {
+            await existingWatcher.reloadManifest();
+          }
+
+          output.appendLine(`Updated properties of "${newName}" (id ${entry.designbucketid}).`);
+          if (
+            newName !== oldName &&
+            [3, 4, 6].includes(entry.designtype) &&
+            useSourceField(entry.designtype, entry.contenttype)
+          ) {
+            // The compiler (not the server) is what actually ties a Java
+            // design element to its class name — javac/ecj requires a
+            // public top-level class's declaration to match its file name,
+            // so renaming only the design element leaves the source out of
+            // sync until it's edited to match too. useSourceField excludes
+            // .jar files, which also live under designtype 4 (SharedCode)
+            // but have no "public class" declaration to update.
+            vscode.window.showWarningMessage(
+              `Renamed "${oldName}" to "${newName}" on the Tornado server. Update the "public class ` +
+                `${oldName}" declaration inside the file to "${newName}" too, or the next compile will fail.`,
+            );
+          } else {
+            vscode.window.showInformationMessage(`Updated "${newName}" on the Tornado server.`);
+          }
+        } catch (error) {
+          output.appendLine(`Failed to update design element properties: ${(error as Error).message}`);
+          output.show(true);
+          vscode.window.showErrorMessage((error as Error).message);
+        }
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "tornado.editApplicationProperties",
+      async (uri?: vscode.Uri) => {
+        const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit properties for"));
+        if (!folder) {
+          return;
+        }
+        const manifest = await readManifest(folder);
+        if (!manifest) {
+          vscode.window.showErrorMessage(`No manifest found in ${folder.fsPath}.`);
+          return;
+        }
+
+        try {
+          const { client, connectionName } = await buildClientForConnection(
+            context,
+            output,
+            manifest.connectionId,
+          );
+          // No per-app GET endpoint exists — the inventory listing is the
+          // only place an application's current properties can be read
+          // from, so this fetches all of them just to find the one match.
+          const items = await client.fetchInventory();
+          const current = items.find((item) => item.appid === manifest.appid);
+          if (!current) {
+            vscode.window.showErrorMessage(
+              `Application id ${manifest.appid} was not found in the server's inventory — it may have been deleted.`,
+            );
+            return;
+          }
+
+          const edits = await editPropertiesViaQuickPick(
+            `Edit properties of "${current.appdisplayname || current.appname}"`,
+            APPLICATION_PROPERTY_FIELDS,
+            (key) => current[key] ?? "",
+          );
+          if (!edits || Object.keys(edits).length === 0) {
+            return;
+          }
+
+          const oldAppName = current.appname;
+          const oldAppGroup = current.appgroup;
+          const newAppName = (edits.appname ?? oldAppName).trim();
+          const newAppGroup = (edits.appgroup ?? oldAppGroup).trim();
+          // appname/appgroup double as local folder-name segments (see
+          // folderName() in workspaceStorage.ts) — guarded the same way
+          // ensureDesignElementFolder already guards them on sync.
+          assertSafePathSegment(newAppName, "app name");
+          if (newAppGroup) {
+            assertSafePathSegment(newAppGroup, "app group");
+          }
+
+          const payload: InventoryItem = {
+            appid: current.appid,
+            appname: newAppName,
+            appdisplayname: current.appdisplayname,
+            appgroup: newAppGroup,
+            description: edits.description ?? current.description,
+            templatename: edits.templatename ?? current.templatename,
+            appversion: current.appversion,
+            inheritfrom: edits.inheritfrom ?? current.inheritfrom,
+          };
+          await client.updateApplication(current.appid, payload);
+
+          let finalFolder = folder;
+          if (newAppName !== oldAppName || newAppGroup !== oldAppGroup) {
+            const key = folder.toString();
+            const wasWatching = activeWatchers.has(key);
+            if (wasWatching) {
+              activeWatchers.get(key)?.dispose();
+              activeWatchers.delete(key);
+            }
+
+            const newFolder = vscode.Uri.joinPath(folder, "..", folderName(connectionName, payload));
+            const renameEdit = new vscode.WorkspaceEdit();
+            renameEdit.renameFile(folder, newFolder, { overwrite: false });
+            const renamed = await vscode.workspace.applyEdit(renameEdit);
+            if (!renamed) {
+              if (wasWatching) {
+                await startWatchingFolder(context, output, activeWatchers, folder);
+              }
+              throw new Error(
+                `Renamed "${oldAppName}" to "${newAppName}" on the server, but failed to rename the ` +
+                  `local folder from "${folder.fsPath}" to "${newFolder.fsPath}" (target may already ` +
+                  'exist). Run "Tornado: Refresh from Server" to bring the local copy back in sync.',
+              );
+            }
+            finalFolder = newFolder;
+            if (wasWatching) {
+              await startWatchingFolder(context, output, activeWatchers, newFolder);
+            }
+          }
+
+          output.appendLine(`Updated properties of application "${newAppName}" (id ${current.appid}).`);
+          // Every field this command edits (appname/appgroup/description/
+          // templatename/inheritfrom) is rendered somewhere in the
+          // Inventory tree — re-fetch rather than leave it
+          // showing stale values until the next manual refresh.
+          treeProvider.refresh();
+          vscode.window.showInformationMessage(
+            finalFolder.fsPath !== folder.fsPath
+              ? `Updated "${newAppName}" on the Tornado server and renamed the local folder to ${finalFolder.fsPath}.`
+              : `Updated "${newAppName}" on the Tornado server.`,
+          );
+        } catch (error) {
+          output.appendLine(`Failed to update application properties: ${(error as Error).message}`);
+          output.show(true);
+          vscode.window.showErrorMessage((error as Error).message);
+        }
+      },
+    ),
   );
 
   // Auto-compile-on-save: saving a .java file always recompiles and

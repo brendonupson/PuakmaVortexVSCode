@@ -11,6 +11,10 @@ export interface InventoryItem {
   inheritfrom: string;
 }
 
+// appid doesn't exist yet — used as the POST body when creating a new
+// application, mirroring NewDesignElementPayload below.
+export type NewApplicationPayload = Omit<InventoryItem, "appid">;
+
 export interface DesignParam {
   paramname: string;
   paramvalue: string;
@@ -99,6 +103,44 @@ export class TornadoClient {
     const items = (await response.json()) as InventoryItem[];
     this.output?.appendLine(`  ${items.length} app(s) in inventory`);
     return items;
+  }
+
+  // Endpoint, method, and payload shape are extrapolated from the
+  // established design-element pattern (GET reads it, PUT with the same
+  // shape updates it) — there's no confirmed spec for updating an
+  // application's own properties anywhere in this codebase, unlike the
+  // design-element endpoints below, which the reference vortex-cli-mirror
+  // tool corroborates. Genuinely unverified against a real server; if the
+  // Tornado server doesn't accept this, this is the first place to check.
+  async updateApplication(appid: number, payload: InventoryItem): Promise<void> {
+    await this.request(`/vortex/${appid}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  // Same extrapolation as updateApplication() above, mirrored onto the
+  // create side the way createDesignElement() mirrors updateDesignElement()
+  // — POST to the collection endpoint, server assumed to respond with the
+  // full created item (to learn its new appid). Genuinely unverified
+  // against a real server; fails loudly rather than silently creating a
+  // local folder with no server-side appid to sync against if the response
+  // shape doesn't match.
+  async createApplication(payload: NewApplicationPayload): Promise<InventoryItem> {
+    const response = await this.request("/vortex", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const created = (await response.json()) as Partial<InventoryItem>;
+    if (typeof created.appid !== "number") {
+      throw new Error(
+        "Tornado server's create-application response did not include a numeric appid — cannot " +
+          "create a local folder for it without one. The response shape assumption may be wrong.",
+      );
+    }
+    return created as InventoryItem;
   }
 
   async fetchApplicationDesign(appid: number): Promise<ApplicationDesign> {

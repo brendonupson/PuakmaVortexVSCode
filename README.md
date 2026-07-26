@@ -153,6 +153,67 @@ are now implemented (with some deliberate gaps noted below). See the
   built-in commands like "Refresh Explorer" directly, so this is a
   companion button rather than the native one gaining new behavior.
 
+- **Editing design element properties**: `Tornado: Edit Design Element
+  Properties`, from the Command Palette (using the active editor's file) or
+  by right-clicking a design element file in the Explorer, opens a picker
+  for the element's `name`/`comment`/`options`/`inheritfrom` — content
+  (`designdata`/`designsource`) and `designparams` aren't touched, and are
+  re-sent exactly as fetched fresh from the server rather than reconstructed
+  from the local file, so a Java element's compiled bytecode (`designdata`)
+  is never overwritten with its source text by accident. Renaming:
+  - Updates the server via the same `PUT` used elsewhere, then renames the
+    local file to match (via a `WorkspaceEdit`, so any editor with it open
+    follows) and updates the manifest — suppressing the app's watcher around
+    the rename first, if it's running, so the delete+create filesystem
+    events a rename produces aren't mistaken for a real deletion.
+  - Is refused for a nested/inner/anonymous class (`Foo$Bar`) — its name is
+    fixed by its enclosing top-level class, and `Tornado: Compile & Upload
+    Java` would just recreate it under the original name on the next
+    compile, orphaning the renamed copy on the server.
+  - For a top-level Actions/SharedCode/ScheduledActions class, succeeds but
+    warns that the `public class` declaration inside the file still needs
+    updating to match — the compiler (not the server) ties a Java design
+    element to its class name, and a mismatched declaration fails to
+    compile.
+
+- **Creating an application**: `Tornado: Create Application` (Command
+  Palette, or the $(new-file) button in the Inventory view's title bar once
+  a connection is active) prompts for the same property set as editing one
+  below (`appname`/`appgroup`/`description`/`templatename`/`inheritfrom`)
+  via the same picker, then `POST`s it to the active connection. **`POST
+  /vortex` is not a confirmed endpoint either** — extrapolated the same way
+  `updateApplication()` extrapolates its `PUT`, by mirroring
+  `createDesignElement()`'s POST-and-read-back-the-new-id pattern onto the
+  application level; see `TornadoClient.createApplication()`. Once created,
+  behaves like picking a freshly-appeared app from the Inventory tree: a
+  local folder is created and its (likely empty) design is synced into it,
+  with an offer to start watching it — but since the application already
+  exists on the server by that point, a failure in this local-sync half is
+  reported as a warning telling you to sync it manually via the Inventory
+  tree, not as a creation failure, so nothing about a network hiccup here
+  would suggest re-running the command (which would create a duplicate
+  application server-side).
+
+- **Editing application properties**: `Tornado: Edit Application
+  Properties`, from the Command Palette (offers a picker of synced apps) or
+  by right-clicking a synced app's folder in the Explorer, edits the
+  application itself rather than one of its design elements —
+  `appname`/`appgroup`/`description`/`templatename`/`inheritfrom`.
+  `appdisplayname` and `appversion` are read (used in the picker's title and
+  left untouched in the update payload) but not editable here. **`PUT
+  /vortex/{appid}` is not a confirmed
+  endpoint** — nothing in this codebase corroborates it, unlike the
+  design-element endpoints; it's extrapolated by symmetry with the existing
+  `GET /vortex/{appid}/` (see `TornadoClient.updateApplication()`) and needs
+  verifying against a real server. Renaming `appname`/`appgroup` — which
+  double as the local folder-name segments, see `folderName()` in
+  `workspaceStorage.ts` — renames the local `.tornado/<folder>` to match
+  (again via a `WorkspaceEdit`), tearing down and restarting the app's
+  watcher around the move if one was running, since a live
+  `vscode.FileSystemWatcher` can't just follow its root folder being
+  renamed out from under it the way a suppressed one can follow a single
+  file rename.
+
 - **Compiling and uploading Java** (`javaCompiler.ts`): `Tornado: Compile &
   Upload Java` batch-compiles all `.java` files under a synced app's
   Actions, SharedCode, and ScheduledActions folders together in one
@@ -220,14 +281,23 @@ are now implemented (with some deliberate gaps noted below). See the
   element — it's never added to the manifest and the watcher explicitly
   ignores it, so it's never uploaded.
 
-  After compiling, each resulting top-level class (nested/inner/anonymous
-  classes — any `.class` file with `$` in its name — are skipped with a
-  warning, since Puakma has no design element for them to map to) is
-  matched back to its manifest entry by class name and uploaded via the
-  same `PUT /vortex/{appid}/design/{designbucketid}` used elsewhere, with
-  both `designdata` (the compiled bytecode) and `designsource` (the current
+  After compiling, each resulting top-level class is matched back to its
+  manifest entry by class name and uploaded via the same
+  `PUT /vortex/{appid}/design/{designbucketid}` used elsewhere, with both
+  `designdata` (the compiled bytecode) and `designsource` (the current
   `.java` text) refreshed in the same request, so both server-side fields
   stay in sync rather than just the bytecode.
+
+  Nested/inner/anonymous classes (any `.class` file with `$` in its name,
+  e.g. `Outer$Inner.class`) have no `.java` of their own to match a manifest
+  entry by name, so they're deployed separately as SharedCode design
+  elements (designtype 4): updated in place if a same-named SharedCode
+  element already exists, or created via `POST /vortex/{appid}/design` the
+  first time one is seen, with the new `designbucketid` recorded in the
+  manifest. Only `designdata` (the bytecode) is sent — there's no source to
+  put in `designsource`. On sync, these come back down as a plain `.class`
+  file (never a `.java`), so they're never mistaken for a real source file
+  and fed back into `ecj`.
 
   **A broken file doesn't hold back the rest of the app**: because of
   `-proceedOnError` above, `CompileResult.failedSourceNames` (sources that

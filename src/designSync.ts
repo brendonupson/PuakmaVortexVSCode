@@ -114,6 +114,18 @@ export function useSourceField(designtype: number, contenttype: string): boolean
   return SOURCE_FIELD_DESIGN_TYPES.has(designtype);
 }
 
+// Nested/inner/anonymous classes (e.g. "Foo$Bar") have no .java of their
+// own — javaCompiler.ts uploads them with designsource left empty, since
+// there's nothing to put there. Writing that empty designsource back out as
+// a "Foo$Bar.java" on sync would hand ecj a real, compilable-looking source
+// file with nothing in it, which it would then dutifully fail to compile on
+// every run thereafter (see compileApp's sourceFiles enumeration, which
+// picks up every .java under these folders). Written as a plain .class
+// instead — bytecode only, never fed back into a compile.
+export function isNestedJavaClassName(designtype: number, name: string): boolean {
+  return JAVA_SOURCE_DESIGN_TYPES.has(designtype) && name.includes("$");
+}
+
 // Java source/class changes under Actions/SharedCode/ScheduledActions are
 // handled exclusively by "Tornado: Compile & Upload Java" (javaCompiler.ts),
 // not the generic per-file watcher — uploading designsource alone wouldn't
@@ -245,17 +257,20 @@ export async function writeDesignElements(
   for (const element of elements) {
     assertSafePathSegment(element.name, "design element name");
 
+    const nestedClass = isNestedJavaClassName(element.designtype, element.name);
     const folder = DESIGN_TYPE_FOLDERS[element.designtype] ?? `Type${element.designtype}`;
-    const fileName = `${element.name}${extensionFor(element.designtype, element.contenttype)}`;
+    const fileName = nestedClass
+      ? `${element.name}.class`
+      : `${element.name}${extensionFor(element.designtype, element.contenttype)}`;
 
     if (!(element.designtype in DESIGN_TYPE_FOLDERS)) {
       // Not one of the known types — its folder wasn't pre-created above.
       await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(appFolder, folder));
     }
 
-    const base64 = useSourceField(element.designtype, element.contenttype)
-      ? element.designsource
-      : element.designdata;
+    const base64 = nestedClass || !useSourceField(element.designtype, element.contenttype)
+      ? element.designdata
+      : element.designsource;
     // The unused field (source vs data) comes back as null, not "", for
     // elements that don't populate it.
     const bytes = Buffer.from(base64 ?? "", "base64");

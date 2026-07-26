@@ -162,7 +162,8 @@ export async function ensureEcj(globalStorageUri: vscode.Uri, output: vscode.Out
 }
 
 export interface CompileResult {
-  classFiles: vscode.Uri[]; // top-level only — nested/inner classes are filtered out (see below) and can't be deployed
+  classFiles: vscode.Uri[]; // top-level only — one per compiled source, matched to its design element by name
+  nestedClassFiles: vscode.Uri[]; // nested/inner/anonymous classes (e.g. Foo$Bar.class) — no source maps to these, so they're uploaded as SharedCode design elements instead, created on the server the first time each one is seen (see compileAndUploadFolder)
   hadErrors: boolean; // true if ecj reported errors — classFiles may still include stub classes for the affected sources (see compileApp)
   failedSourceNames: string[]; // base names (no extension) of sources that produced no class at all, even as a stub
 }
@@ -279,23 +280,24 @@ export async function compileApp(
 
   const compiled = await vscode.workspace.fs.readDirectory(outDir);
   const classFiles: vscode.Uri[] = [];
-  const nested: string[] = [];
+  const nestedClassFiles: vscode.Uri[] = [];
   for (const [name, type] of compiled) {
     if (type !== vscode.FileType.File || !name.endsWith(".class")) {
       continue;
     }
     if (name.includes("$")) {
-      // Nested/inner/anonymous classes — Puakma can't deploy these as
-      // design elements (there's no design element for them to map to).
-      nested.push(name);
+      // Nested/inner/anonymous classes — no .java source of their own to
+      // match a design element by name, so they're uploaded separately as
+      // SharedCode design elements (see compileAndUploadFolder).
+      nestedClassFiles.push(vscode.Uri.joinPath(outDir, name));
       continue;
     }
     classFiles.push(vscode.Uri.joinPath(outDir, name));
   }
-  if (nested.length > 0) {
+  if (nestedClassFiles.length > 0) {
     output.appendLine(
-      `Warning: nested/inner/anonymous classes compiled (${nested.join(", ")}) — these cannot ` +
-        "be deployed as design elements; refactor to top-level classes if you need them uploaded.",
+      `${nestedClassFiles.length} nested/inner/anonymous class(es) compiled — will be uploaded as ` +
+        "SharedCode design element(s).",
     );
   }
 
@@ -311,5 +313,5 @@ export async function compileApp(
         : "") +
       ".",
   );
-  return { classFiles, hadErrors, failedSourceNames };
+  return { classFiles, nestedClassFiles, hadErrors, failedSourceNames };
 }

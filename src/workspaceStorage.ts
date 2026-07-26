@@ -14,7 +14,7 @@ export function assertSafePathSegment(segment: string, label: string): void {
   }
 }
 
-function folderName(connectionName: string, app: Pick<InventoryItem, "appgroup" | "appname">): string {
+export function folderName(connectionName: string, app: Pick<InventoryItem, "appgroup" | "appname">): string {
   // appgroup is optional (can be ""), so it's dropped rather than leaving a
   // stray double underscore.
   return [connectionName, app.appgroup, app.appname].filter((part) => part.length > 0).join("_");

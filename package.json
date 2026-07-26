@@ -50,6 +50,11 @@
         "title": "Tornado: Sync Application to Workspace"
       },
       {
+        "command": "tornado.createApplication",
+        "title": "Tornado: Create Application",
+        "icon": "$(new-file)"
+      },
+      {
         "command": "tornado.startWatching",
         "title": "Tornado: Start Watching Application"
       },
@@ -69,6 +74,14 @@
       {
         "command": "tornado.refreshServerLibraries",
         "title": "Tornado: Refresh Server Libraries"
+      },
+      {
+        "command": "tornado.editDesignElementProperties",
+        "title": "Tornado: Edit Design Element Properties"
+      },
+      {
+        "command": "tornado.editApplicationProperties",
+        "title": "Tornado: Edit Application Properties"
       }
     ],
     "configuration": {
@@ -150,6 +163,18 @@
       }
     ],
     "menus": {
+      "explorer/context": [
+        {
+          "command": "tornado.editDesignElementProperties",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\.tornado/ && resourceFilename != devconfig.json",
+          "group": "7_modification@1"
+        },
+        {
+          "command": "tornado.editApplicationProperties",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\.tornado/",
+          "group": "7_modification@1"
+        }
+      ],
       "view/title": [
         {
           "command": "tornado.refreshInventory",
@@ -165,6 +190,11 @@
           "command": "tornado.addConnection",
           "when": "view == tornadoInventory",
           "group": "navigation@3"
+        },
+        {
+          "command": "tornado.createApplication",
+          "when": "view == tornadoInventory && tornado.hasActiveConnection",
+          "group": "navigation@4"
         },
         {
           "command": "tornado.editConnection",

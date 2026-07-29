@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { InventoryItem } from "./tornadoClient";
 
-// TODO: decide whether .tornado/ should be git-ignored (a local sync cache)
+// TODO: decide whether tornado/ should be git-ignored (a local sync cache)
 // or committed (the source of truth for the application's design elements).
 // Left unresolved for now — not added to .gitignore.
 
@@ -37,7 +37,7 @@ export async function ensureDesignElementFolder(
 
   const folderUri = vscode.Uri.joinPath(
     workspaceFolder.uri,
-    ".tornado",
+    "tornado",
     folderName(connectionName, app),
   );
   await vscode.workspace.fs.createDirectory(folderUri);

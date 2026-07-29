@@ -132,7 +132,7 @@ async function syncDesignToFolder(
   // otherwise-successful file sync.
   try {
     const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
-    await ensureServerLibraries(tornadoRoot, connectionId, client, output);
+    await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
     const justConfigured = await ensureJavaIntelliSense(output);
     if (justConfigured) {
       vscode.window.showInformationMessage(
@@ -288,6 +288,13 @@ async function compileAndUploadFolder(
   return { uploaded, skipped, hadErrors: result.hadErrors, failedSourceNames: result.failedSourceNames };
 }
 
+// "/appgroup/appname" (appgroup dropped when empty, i.e. ungrouped) — used
+// wherever an app is named in UI text, so an app is distinguishable from a
+// same-named app in a different group.
+function appPathLabel(app: Pick<InventoryItem, "appgroup" | "appname">): string {
+  return `/${[app.appgroup, app.appname].filter((part) => part.length > 0).join("/")}`;
+}
+
 function formatCompileSummary(result: CompileAndUploadSummary): string {
   const parts = [`uploaded ${result.uploaded} Java design element(s)`];
   if (result.skipped > 0) {
@@ -396,7 +403,7 @@ async function pickSyncedAppFolder(placeHolder: string): Promise<vscode.Uri | un
     return undefined;
   }
   const manifests = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(workspaceFolder, ".tornado/*/.tornado-manifest.json"),
+    new vscode.RelativePattern(workspaceFolder, "tornado/*/.tornado-manifest.json"),
   );
   if (manifests.length === 0) {
     vscode.window.showInformationMessage("No synced Tornado applications found in this workspace.");
@@ -761,13 +768,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
           const wasWatching = activeWatchers.has(folder.toString());
-          const result = await syncDesignToFolder(
-            context,
-            output,
-            activeWatchers,
-            folder,
-            app.appid,
-            connection.id,
+          const appid = app.appid;
+          const result = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `Syncing "${appPathLabel(app)}"...`,
+            },
+            () => syncDesignToFolder(context, output, activeWatchers, folder, appid, connection.id),
           );
 
           if (wasWatching) {
@@ -870,13 +877,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
       try {
         const folder = await ensureDesignElementFolder(connection.name, created);
-        const result = await syncDesignToFolder(
-          context,
-          output,
-          activeWatchers,
-          folder,
-          created.appid,
-          connection.id,
+        const result = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Syncing "${appPathLabel(created)}"...`,
+          },
+          () => syncDesignToFolder(context, output, activeWatchers, folder, created.appid, connection.id),
         );
 
         const startWatchingAction = "Start Watching";
@@ -941,13 +947,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       try {
-        const result = await syncDesignToFolder(
-          context,
-          output,
-          activeWatchers,
-          folder,
-          manifest.appid,
-          manifest.connectionId,
+        const result = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Refreshing "${folder.fsPath.split("/").pop()}"...`,
+          },
+          () => syncDesignToFolder(context, output, activeWatchers, folder, manifest.appid, manifest.connectionId),
         );
         vscode.window.showInformationMessage(
           `Refreshed ${result.written} design element(s) in ${folder.fsPath}`,
@@ -1029,7 +1034,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           manifest.connectionId,
         );
         const tornadoRoot = vscode.Uri.joinPath(folder, "..");
-        await ensureServerLibraries(tornadoRoot, manifest.connectionId, client, output, true);
+        await ensureServerLibraries(tornadoRoot, folder, manifest.connectionId, client, output, true);
         await ensureJavaIntelliSense(output);
         vscode.window.showInformationMessage(`Refreshed server libraries for "${connectionName}".`);
       } catch (error) {

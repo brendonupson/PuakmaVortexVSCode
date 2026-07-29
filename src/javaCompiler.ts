@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { TornadoClient } from "./tornadoClient";
-import { DEV_CONFIG_RELATIVE_PATH, readDevConfig } from "./designSync";
+import { AGENT_INSTRUCTION_FILENAMES, DEV_CONFIG_RELATIVE_PATH, readDevConfig } from "./designSync";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,7 +20,7 @@ const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"];
 // skipped by handleCreate's existing unrecognised-folder check.
 export const COMPILE_OUTPUT_FOLDER = "zbin";
 
-const SERVER_LIB_FOLDER = ".lib"; // sits alongside app folders, directly under .tornado/
+const SERVER_LIB_FOLDER = ".lib"; // sits alongside app folders, directly under tornado/
 const SYSTEM_JAR_FILENAME = "puakma.jar";
 const LIBRARIES_ZIP_FILENAME = "libraries.zip";
 const LIBRARIES_EXTRACT_FOLDER = "libraries";
@@ -101,14 +101,39 @@ async function extractLibrariesZip(zipUri: vscode.Uri, destDir: vscode.Uri): Pro
   }
 }
 
+// A CLAUDE.md/AGENTS.md sitting at the root of the shared libraries zip is
+// guidance for AI coding assistants, not a jar — mirrored into each app
+// folder so it's visible alongside the app's own code, whichever agent the
+// user has. This is a one-way copy, not a design element: re-run on every
+// ensureServerLibraries call (not just when the zip is freshly unzipped) so
+// every app stays in sync with the shared copy, silently overwriting any
+// local edits. That's intentional — the watcher never uploads either file
+// (see appWatcher.ts), so a local edit has nowhere to go and isn't preserved.
+async function copyAgentInstructionFiles(
+  librariesDir: vscode.Uri,
+  appFolder: vscode.Uri,
+  output: vscode.OutputChannel,
+): Promise<void> {
+  for (const filename of AGENT_INSTRUCTION_FILENAMES) {
+    const source = vscode.Uri.joinPath(librariesDir, filename);
+    if (!(await exists(source))) {
+      continue;
+    }
+    const dest = vscode.Uri.joinPath(appFolder, filename);
+    await vscode.workspace.fs.copy(source, dest, { overwrite: true });
+    output.appendLine(`  copied ${filename} from shared libraries into ${appFolder.fsPath}`);
+  }
+}
+
 // Downloads (or reuses a locally cached copy of) the server's own
 // puakma.jar and shared-library jars via GET /vortex/systemjar and
 // GET /vortex/libraries, so Java design elements are compiled against
 // exactly the classes the server runs. Cached per-connection under
-// .tornado/.lib/<connectionId>/, since these are server-wide rather than
+// tornado/.lib/<connectionId>/, since these are server-wide rather than
 // per-app. Pass forceRefresh after a server-side upgrade to re-download.
 export async function ensureServerLibraries(
   tornadoRoot: vscode.Uri,
+  appFolder: vscode.Uri,
   connectionId: string,
   client: TornadoClient,
   output: vscode.OutputChannel,
@@ -137,6 +162,8 @@ export async function ensureServerLibraries(
     libraryJars = await findJarsRecursive(librariesDir);
     output.appendLine(`  ${libraryJars.length} jar(s) extracted`);
   }
+
+  await copyAgentInstructionFiles(librariesDir, appFolder, output);
 
   return [systemJarUri.fsPath, ...libraryJars];
 }
@@ -195,11 +222,11 @@ export async function compileApp(
     return undefined;
   }
 
-  // appFolder is .tornado/<connectionName>_<appgroup>_<appname>/, so its
-  // parent is .tornado/ itself — where the shared per-connection lib cache
+  // appFolder is tornado/<connectionName>_<appgroup>_<appname>/, so its
+  // parent is tornado/ itself — where the shared per-connection lib cache
   // lives, alongside (not inside) any particular app's folder.
   const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
-  const serverClasspath = await ensureServerLibraries(tornadoRoot, connectionId, client, output);
+  const serverClasspath = await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
   const extraClasspath = vscode.workspace.getConfiguration("tornado").get<string[]>("compileClasspath", []);
   const classpath = [...serverClasspath, ...extraClasspath];
 

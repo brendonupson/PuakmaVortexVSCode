@@ -5,6 +5,7 @@ import {
   TornadoClient,
 } from "./tornadoClient";
 import {
+  AGENT_INSTRUCTION_FILENAMES,
   DEV_CONFIG_RELATIVE_PATH,
   Manifest,
   ManifestEntry,
@@ -96,6 +97,7 @@ export class AppWatcher implements vscode.Disposable {
       !relativePath ||
       relativePath === MANIFEST_FILENAME ||
       relativePath === DEV_CONFIG_RELATIVE_PATH ||
+      AGENT_INSTRUCTION_FILENAMES.includes(relativePath) ||
       this.findEntry(relativePath)
     ) {
       return;
@@ -164,7 +166,11 @@ export class AppWatcher implements vscode.Disposable {
 
   private async handleChange(uri: vscode.Uri): Promise<void> {
     const relativePath = this.toRelativePath(uri);
-    if (!relativePath || relativePath === MANIFEST_FILENAME) {
+    if (
+      !relativePath ||
+      relativePath === MANIFEST_FILENAME ||
+      AGENT_INSTRUCTION_FILENAMES.includes(relativePath)
+    ) {
       return;
     }
 

@@ -59,7 +59,7 @@ are now implemented (with some deliberate gaps noted below). See the
   channel) an active connection whose inventory fetch actually failed —
   distinct from an empty tree meaning "not configured."
 - **Design element folder**: clicking an app in the Inventory tree creates
-  `.tornado/<connectionName>_<appgroup>_<appname>/` in the open workspace
+  `tornado/<connectionName>_<appgroup>_<appname>/` in the open workspace
   (appgroup is optional and dropped when empty), fetches its full design via
   `GET /vortex/{appid}/` with HTTP Basic Auth, and writes each element from
   the response's `designelements` array to disk (`designSync.ts`). If no
@@ -101,7 +101,7 @@ are now implemented (with some deliberate gaps noted below). See the
   message offers a "Start Watching" button (or run `Tornado: Start
   Watching Application` / `Tornado: Stop Watching Application` from the
   Command Palette, which lists synced apps found via
-  `.tornado/*/.tornado-manifest.json`). While watching, a
+  `tornado/*/.tornado-manifest.json`). While watching, a
   `vscode.FileSystemWatcher` on that app's folder does:
   - **Change** → `PUT /vortex/{appid}/design/{designbucketid}`, same JSON
     shape as a downloaded element, with the edited field (`designsource` or
@@ -141,6 +141,17 @@ are now implemented (with some deliberate gaps noted below). See the
     short drain delay, since filesystem events can lag slightly behind the
     write that caused them) so the fresh download doesn't get echoed back
     to the server as a wave of redundant uploads.
+
+- **Progress feedback**: syncing an app (clicking it in the Inventory tree
+  or running `Tornado: Sync Application to Workspace`), the sync half of
+  `Tornado: Create Application`, and `Tornado: Refresh from Server` each
+  wrap their download in a `vscode.window.withProgress` notification-style
+  toast so background work is visible rather than silent — sync/create
+  titles it with the app's `/appgroup/appname` (`appPathLabel()` in
+  `extension.ts`, group segment dropped when ungrouped) so a same-named app
+  in a different group isn't ambiguous. Notification-location progress
+  stacks per call, so clicking several apps in quick succession shows one
+  toast per app rather than one being silently overwritten by the next.
 
 - **Refreshing from the server**: `Tornado: Refresh from Server` re-runs a
   sync (fetch + overwrite local files, using the same
@@ -207,7 +218,7 @@ are now implemented (with some deliberate gaps noted below). See the
   `GET /vortex/{appid}/` (see `TornadoClient.updateApplication()`) and needs
   verifying against a real server. Renaming `appname`/`appgroup` — which
   double as the local folder-name segments, see `folderName()` in
-  `workspaceStorage.ts` — renames the local `.tornado/<folder>` to match
+  `workspaceStorage.ts` — renames the local `tornado/<folder>` to match
   (again via a `WorkspaceEdit`), tearing down and restarting the app's
   watcher around the move if one was running, since a live
   `vscode.FileSystemWatcher` can't just follow its root folder being
@@ -252,7 +263,7 @@ are now implemented (with some deliberate gaps noted below). See the
   would be). This guarantees client and server are compiling against the
   same code, and sidesteps having to bundle or license a third-party
   server-framework jar. Both are cached per-connection under
-  `.tornado/.lib/<connectionId>/` (shared across every app synced from that
+  `tornado/.lib/<connectionId>/` (shared across every app synced from that
   connection) and only re-downloaded if missing — this happens
   automatically on every sync/refresh (`syncDesignToFolder()` in
   `extension.ts`, non-fatal if it fails, so a server without these
@@ -262,6 +273,16 @@ are now implemented (with some deliberate gaps noted below). See the
   a fresh copy.
   `tornado.compileClasspath` (a settings array, empty by default) can add
   extra jar/directory paths on top of the server-provided ones if needed.
+
+  If the shared libraries zip has a `CLAUDE.md` and/or `AGENTS.md` at its
+  root, they're mirrored into the root of every app folder synced from that
+  connection (`copyAgentInstructionFiles()` in `javaCompiler.ts`) — guidance
+  for AI coding assistants working in the app folder, whichever agent is in
+  use. This is a one-way copy, not a design element: re-run on every sync/
+  compile/refresh (not only when the zip is freshly downloaded), so a local
+  edit is silently overwritten the next time round. The watcher explicitly
+  skips both filenames (`AGENT_INSTRUCTION_FILENAMES` in `designSync.ts`,
+  same treatment as `devconfig.json`), so neither is ever uploaded.
 
   The `java` launcher used to run `ecj` is located via `tornado.javaHome`
   (a setting, empty by default), then `$JAVA_HOME`, then `java` on `PATH`.
@@ -328,7 +349,7 @@ are now implemented (with some deliberate gaps noted below). See the
   classpath for them and shows framework types like `ActionRunner` as
   "cannot be resolved to a type" even though compilation works fine. Every
   sync/refresh that downloads server jars also adds
-  `.tornado/.lib/**/*.jar` to the workspace's `java.project.referencedLibraries`
+  `tornado/.lib/**/*.jar` to the workspace's `java.project.referencedLibraries`
   setting (merged in, not overwritten, and only once — existing entries are
   left alone). Requires the `redhat.java` extension to be installed; if it
   isn't, this is skipped with a note in the "Tornado" output channel rather
@@ -336,7 +357,7 @@ are now implemented (with some deliberate gaps noted below). See the
   the Java Language Server Workspace" to pick up a newly-added classpath
   entry — the extension prompts for that the first time it adds one.
 
-Open decision: whether `.tornado/` should be git-ignored (a local sync
+Open decision: whether `tornado/` should be git-ignored (a local sync
 cache) or committed (the source of truth) — not yet resolved.
 
 ## Development

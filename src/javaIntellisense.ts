@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 
 const REFERENCED_LIBRARIES_KEY = "project.referencedLibraries";
-const LIB_GLOB = ".tornado/.lib/**/*.jar";
+const LIB_GLOB = "tornado/.lib/**/*.jar";
 const JAVA_EXTENSION_ID = "redhat.java";
 
 type ReferencedLibraries =

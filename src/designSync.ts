@@ -194,6 +194,16 @@ const DEV_CONFIG_FOLDER = "Documentation";
 const DEV_CONFIG_FILENAME = "devconfig.json";
 export const DEV_CONFIG_RELATIVE_PATH = `${DEV_CONFIG_FOLDER}/${DEV_CONFIG_FILENAME}`;
 
+// Mirrored into the app folder root from the shared libraries zip (see
+// copyAgentInstructionFiles in javaCompiler.ts) — a one-way copy, not a
+// design element: never written to the manifest, and explicitly skipped by
+// the watcher (see appWatcher.ts) so local edits are never uploaded and are
+// silently overwritten the next time server libraries are refreshed.
+// AGENTS.md is the same idea for coding agents other than Claude Code.
+export const CLAUDE_MD_FILENAME = "CLAUDE.md";
+export const AGENTS_MD_FILENAME = "AGENTS.md";
+export const AGENT_INSTRUCTION_FILENAMES = [CLAUDE_MD_FILENAME, AGENTS_MD_FILENAME];
+
 export interface DevConfig {
   javaVersion: string;
 }

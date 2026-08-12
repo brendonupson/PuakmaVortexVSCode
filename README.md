@@ -187,6 +187,46 @@ are now implemented (with some deliberate gaps noted below). See the
     element to its class name, and a mismatched declaration fails to
     compile.
 
+- **Editing design element parameters** (`designparams`): `Tornado: Edit
+  Design Element Parameters`, from the Command Palette (using the active
+  editor's file) or by right-clicking a design element file in the Explorer.
+  **Only Pages, Resources and Actions have editable parameters** — SharedCode,
+  Documentation, ScheduledActions and Widgets have none, so the context-menu
+  entry is hidden for them (its `when` clause matches only the `Pages`,
+  `Resources` and `Actions` folders, which also keeps it off `devconfig.json`,
+  `CLAUDE.md`/`AGENTS.md` and `zbin/`; note that `ScheduledActions/` does
+  *not* match the `Actions` alternative, since the clause anchors each folder
+  name between slashes). The command re-checks the design type itself, since
+  the Command Palette route runs against whatever file is in the active
+  editor without consulting any `when` clause. `supportsDesignParams()` in
+  `designSync.ts` is the source of truth for the type numbers; the folder
+  names in `package.json` have to be kept in step with it.
+
+  For the types that do have them, **which parameters exist depends on the
+  design type**, mirroring the
+  server's own `saveParams()`: every type carries `AnonymousAccess`,
+  `MinifyLevel` and `CompositeElement` (each set to `1` or not set at all),
+  and a **Page** additionally carries `OpenAction` and `SaveAction` (picked
+  from the app's Actions) and `ParentPage` (picked from its Pages). Any other
+  parameter the element already has is listed after those as free text and
+  re-sent as-is — the client never drops one it doesn't recognise, though
+  whether the server persists a name outside its own `saveParams()` list is
+  up to the server. The `1`-or-absent rule is the same as for application
+  parameters above: a parameter set to nothing is omitted rather than written
+  as an empty string, while one the server already has blank and nobody
+  touched is re-sent untouched.
+
+  Reading and writing go through `GET`/`PUT
+  /vortex/{appid}/design/{designbucketid}/params` — the design-element-level
+  counterpart of `/vortex/{appid}/appparams` — with the `PUT` body wrapped as
+  `{"designparams": [...]}` (that key rather than the URL's `params`, to match
+  the field name design elements already use in their own JSON). The
+  element's content is never fetched or re-sent, so a parameter change can't
+  disturb `designdata`/`designsource`. **The manifest's copy of
+  `designparams` is updated too, and that matters**: the watcher re-sends the
+  manifest's parameters with every file upload, so a stale copy there would
+  silently revert a parameter change the next time the file was saved.
+
 - **Creating an application**: `Tornado: Create Application` (Command
   Palette, or the $(new-file) button in the Inventory view's title bar once
   a connection is active) prompts for the same property set as editing one
@@ -224,6 +264,43 @@ are now implemented (with some deliberate gaps noted below). See the
   `vscode.FileSystemWatcher` can't just follow its root folder being
   renamed out from under it the way a suppressed one can follow a single
   file rename.
+
+- **Editing application parameters** (`APPPARAM`): `Tornado: Edit Application
+  Parameters`, from the Command Palette or by right-clicking a synced app's
+  folder in the Explorer, edits the application's key/value parameters. The
+  dialog is the same QuickPick loop the two property editors use, listing ten
+  well-known parameter names with their current values: `OpenAction`,
+  `OpenAction1`, `SaveAction`, `SaveAction1` (picked from the app's Actions),
+  `LoginPage` (picked from its Pages), `DefaultOpen` (free text),
+  `DisableApp`, `DisableScheduledActions`, `ForceSecureConn` (set to `1` or
+  not set at all), and `DefaultLocale` (picked from a locale list showing
+  e.g. "English (Australia)" while storing `en-AU`). Action/Page choices come
+  from the local manifest — i.e. the last sync — so every choice list also
+  offers manual entry for a value that exists server-side but isn't synced
+  locally. Locale labels are generated with `Intl.DisplayNames`
+  (`languageDisplay: "standard"`, with a hand-composed fallback for older ICU
+  builds that ignore the option, which would otherwise render "Australian
+  English"). Parameters the application already has beyond those ten are
+  listed after them as free text and re-sent as-is — the client never drops
+  one it doesn't recognise, though whether the server persists a name outside
+  its own list is up to the server.
+
+  **A parameter set to nothing is omitted from the save, not written as an
+  empty string** — that's how "`1` or not set" is expressed. To avoid that
+  rule deleting rows nobody touched, a parameter the server already has with
+  a blank value is re-sent unchanged unless it was actually edited.
+
+  Reading and writing go through `GET`/`PUT /vortex/{appid}/appparams`, a
+  collection of its own alongside `/vortex/{appid}/design` — so editing a
+  parameter touches neither the application's own properties nor its design
+  elements. The `PUT` body is `{"appparams": [...]}` — the full set, which
+  replaces the old one, so a parameter the editor drops is expressed by its
+  absence (a partial write couldn't remove anything). It's wrapped in an
+  object rather than sent as a bare top-level array because the server reads
+  no data from a bare array, and because every other write in this API is an
+  object anyway. The read is deliberately tolerant (`extractAppParams()` in
+  `tornadoClient.ts`): it takes that wrapped form, an object wrapping the
+  array under any other key, or a bare array.
 
 - **Compiling and uploading Java** (`javaCompiler.ts`): `Tornado: Compile &
   Upload Java` batch-compiles all `.java` files under a synced app's

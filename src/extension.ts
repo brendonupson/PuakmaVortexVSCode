@@ -9,7 +9,9 @@ import {
   updateConnection,
 } from "./config";
 import {
+  AppParam,
   DesignElementPayload,
+  DesignParam,
   NewApplicationPayload,
   NewDesignElementPayload,
   InventoryItem,
@@ -22,10 +24,12 @@ import {
   DEV_CONFIG_RELATIVE_PATH,
   Manifest,
   ManifestEntry,
+  designTypeFolder,
   extensionFor,
   inferContentType,
   isNestedJavaClassName,
   readManifest,
+  supportsDesignParams,
   useSourceField,
   writeDesignElements,
   writeManifestFile,
@@ -314,16 +318,40 @@ function formatCompileSummary(result: CompileAndUploadSummary): string {
   return parts.join("; ");
 }
 
+interface FieldChoice {
+  label: string;
+  value: string;
+}
+
 interface EditableFieldDef<K extends string> {
   key: K;
   label: string;
   prompt: string;
+  // How the value is entered. "text" (the default) is a plain input box;
+  // "choice" opens a second QuickPick built from choices(); "flag" is the
+  // Tornado convention of a parameter that's either "1" or simply absent.
+  kind?: "text" | "choice" | "flag";
+  choices?: () => FieldChoice[];
+  // Value -> what's shown next to the field name (e.g. "en-AU" shown as
+  // "English (Australia)"). Not applied to empty values, which always show
+  // emptyLabel instead.
+  describe?: (value: string) => string;
+  emptyLabel?: string;
 }
 
 interface PropertyQuickPickItem<K extends string> extends vscode.QuickPickItem {
   action: "edit" | "save" | "cancel";
   field?: K;
 }
+
+interface ChoiceQuickPickItem extends vscode.QuickPickItem {
+  // undefined means "let me type a value instead" — the escape hatch for a
+  // value the choice list can't know about.
+  value?: string;
+  manual?: boolean;
+}
+
+const FLAG_SET_VALUE = "1";
 
 // Shared by tornado.editDesignElementProperties and
 // tornado.editApplicationProperties: a QuickPick listing each editable
@@ -341,12 +369,15 @@ async function editPropertiesViaQuickPick<K extends string>(
 
   while (true) {
     const items: PropertyQuickPickItem<K>[] = [
-      ...fields.map((field) => ({
-        label: field.label,
-        description: valueOf(field.key) || "(empty)",
-        action: "edit" as const,
-        field: field.key,
-      })),
+      ...fields.map((field) => {
+        const value = valueOf(field.key);
+        return {
+          label: field.label,
+          description: value ? field.describe?.(value) ?? value : field.emptyLabel ?? "(empty)",
+          action: "edit" as const,
+          field: field.key,
+        };
+      }),
       { label: "$(check) Save Changes", action: "save" as const },
       { label: "$(x) Cancel Without Saving", action: "cancel" as const },
     ];
@@ -362,16 +393,72 @@ async function editPropertiesViaQuickPick<K extends string>(
       return edits;
     }
     const field = fields.find((f) => f.key === picked.field)!;
-    const newValue = await vscode.window.showInputBox({
-      prompt: field.prompt,
-      value: valueOf(field.key),
-      ignoreFocusOut: true,
-    });
+    const newValue = await promptForFieldValue(field, valueOf(field.key));
+    // Escaping out of the value prompt (or its sub-picker) drops back to the
+    // list without recording an edit, rather than cancelling the whole dialog.
     if (newValue === undefined) {
       continue;
     }
     edits[field.key] = newValue;
   }
+}
+
+// The per-field half of editPropertiesViaQuickPick above: turns one field
+// definition into whatever input its kind calls for. Returns undefined when
+// the user backs out without choosing.
+async function promptForFieldValue<K extends string>(
+  field: EditableFieldDef<K>,
+  currentValue: string,
+): Promise<string | undefined> {
+  if (field.kind === "flag") {
+    const picked = await vscode.window.showQuickPick<ChoiceQuickPickItem>(
+      [
+        {
+          label: `Set ('${FLAG_SET_VALUE}')`,
+          description: currentValue !== "" ? "current" : undefined,
+          value: FLAG_SET_VALUE,
+        },
+        {
+          label: "Not set",
+          description: currentValue === "" ? "current — removes this parameter" : "removes this parameter",
+          value: "",
+        },
+      ],
+      { title: field.prompt, ignoreFocusOut: true },
+    );
+    return picked?.value;
+  }
+
+  if (field.kind === "choice") {
+    const choices = field.choices?.() ?? [];
+    const picked = await vscode.window.showQuickPick<ChoiceQuickPickItem>(
+      [
+        { label: "$(circle-slash) (not set)", value: "" },
+        ...choices.map((choice) => ({
+          label: choice.label,
+          description: choice.label === choice.value ? undefined : choice.value,
+          value: choice.value,
+        })),
+        // The choice list is built from local state (the manifest, a static
+        // locale list), so a value that's valid server-side but not synced
+        // locally would otherwise be unreachable.
+        { label: "$(edit) Enter a value manually...", manual: true },
+      ],
+      { title: field.prompt, ignoreFocusOut: true },
+    );
+    if (!picked) {
+      return undefined;
+    }
+    if (!picked.manual) {
+      return picked.value;
+    }
+  }
+
+  return vscode.window.showInputBox({
+    prompt: field.prompt,
+    value: currentValue,
+    ignoreFocusOut: true,
+  });
 }
 
 // Shared by tornado.createApplication and tornado.editApplicationProperties
@@ -393,6 +480,209 @@ const APPLICATION_PROPERTY_FIELDS: EditableFieldDef<ApplicationPropertyField>[] 
     prompt: "Name of the application to inherit from, or leave empty for none",
   },
 ];
+
+// Offered for DefaultLocale. Not exhaustive by design — the picker's
+// "Enter a value manually..." escape hatch covers any tag not listed here.
+const LOCALE_CODES = [
+  "en-AU", "en-CA", "en-GB", "en-IE", "en-IN", "en-NZ", "en-US", "en-ZA",
+  "ar-SA", "cs-CZ", "da-DK", "de-AT", "de-CH", "de-DE", "el-GR", "es-ES",
+  "es-MX", "fi-FI", "fr-CA", "fr-FR", "he-IL", "hi-IN", "hu-HU", "id-ID",
+  "it-IT", "ja-JP", "ko-KR", "ms-MY", "nb-NO", "nl-NL", "pl-PL", "pt-BR",
+  "pt-PT", "ro-RO", "ru-RU", "sv-SE", "th-TH", "tr-TR", "uk-UA", "vi-VN",
+  "zh-CN", "zh-HK", "zh-TW",
+];
+
+// "en-AU" -> "English (Australia)". languageDisplay: "standard" is what
+// produces that parenthesised form — the default ("dialect") renders
+// "Australian English" instead. Older ICU builds ignore the option, so the
+// dialect form is detected (no parentheses) and composed by hand from the
+// language and region subtags. Falls back to the raw tag throughout: a
+// display-name lookup must never be why this command fails.
+function localeLabel(code: string): string {
+  try {
+    const asLanguage = new Intl.DisplayNames(["en"], {
+      type: "language",
+      languageDisplay: "standard",
+    });
+    const label = asLanguage.of(code);
+    if (!label || label === code) {
+      return code;
+    }
+    const region = code.split("-")[1];
+    if (label.includes("(") || !region) {
+      return label;
+    }
+    const base = asLanguage.of(code.split("-")[0]) ?? code;
+    const regionName = new Intl.DisplayNames(["en"], { type: "region" }).of(region) ?? region;
+    return `${base} (${regionName})`;
+  } catch {
+    return code;
+  }
+}
+
+function localeChoices(): FieldChoice[] {
+  return LOCALE_CODES.map((code) => ({ label: localeLabel(code), value: code })).sort((a, b) =>
+    a.label.localeCompare(b.label),
+  );
+}
+
+// Design element names of one type, from the already-loaded manifest — no
+// round trip. Reflects the last sync, which is why every choice picker also
+// offers manual entry.
+function designElementChoices(manifest: Manifest, designtype: number): FieldChoice[] {
+  const names = [...new Set(manifest.elements.filter((e) => e.designtype === designtype).map((e) => e.name))];
+  return names.sort((a, b) => a.localeCompare(b)).map((name) => ({ label: name, value: name }));
+}
+
+const ACTION_DESIGN_TYPE = 3;
+const PAGE_DESIGN_TYPE = 1;
+
+// Field constructors shared by the application-parameter and design-element-
+// parameter editors below. Both edit a {paramname, paramvalue}[] where a
+// parameter's *absence* is meaningful, so both label an empty value
+// "(not set)" rather than "(empty)".
+function flagParamField(key: string, prompt: string): EditableFieldDef<string> {
+  return { key, label: key, prompt, kind: "flag", emptyLabel: "(not set)" };
+}
+
+function choiceParamField(
+  key: string,
+  prompt: string,
+  choices: () => FieldChoice[],
+): EditableFieldDef<string> {
+  return { key, label: key, prompt, kind: "choice", choices, emptyLabel: "(not set)" };
+}
+
+function textParamField(key: string, prompt: string): EditableFieldDef<string> {
+  return { key, label: key, prompt, emptyLabel: "(not set)" };
+}
+
+// Parameters already set on the server that aren't among the known names for
+// this application/design type — appended as plain text fields so they're
+// visible and editable rather than silently carried through the save.
+function appendUnknownParamFields(
+  fields: EditableFieldDef<string>[],
+  current: { paramname: string }[],
+): EditableFieldDef<string>[] {
+  for (const param of current) {
+    if (!fields.some((field) => field.key === param.paramname)) {
+      fields.push(textParamField(param.paramname, `Value for ${param.paramname}`));
+    }
+  }
+  return fields;
+}
+
+interface ParamMergeResult {
+  params: AppParam[];
+  changes: string[];
+}
+
+// Turns the edits a QuickPick session produced into the full parameter array
+// to send, plus a human-readable list of what actually changed (empty when
+// nothing did, so the caller can skip the write entirely).
+//
+// Server order comes first so untouched parameters keep their place, then
+// any known name being set for the first time. A parameter is dropped only
+// when it was *edited* to empty — one the server already has with a blank
+// value and nobody touched is re-sent as it was, so saving one field can't
+// quietly delete another.
+function mergeParamEdits(
+  current: { paramname: string; paramvalue: string }[],
+  fields: EditableFieldDef<string>[],
+  edits: Partial<Record<string, string>>,
+): ParamMergeResult {
+  // String() rather than a bare cast: these arrays come straight from the
+  // server, and a paramvalue serialised as a number (e.g. 1 for a flag)
+  // would otherwise blow up on .trim() below.
+  const currentByName = new Map(current.map((param) => [param.paramname, String(param.paramvalue ?? "")]));
+  const changes: string[] = [];
+  const params: AppParam[] = [];
+  const emitted = new Set<string>();
+
+  const emit = (paramname: string): void => {
+    if (emitted.has(paramname)) {
+      return;
+    }
+    emitted.add(paramname);
+    const edited = edits[paramname];
+    const existing = currentByName.get(paramname);
+    const value = (edited ?? existing ?? "").trim();
+    if (edited !== undefined && edited.trim() !== (existing ?? "").trim()) {
+      changes.push(value ? `Set ${paramname} = "${value}"` : `Cleared ${paramname}`);
+    }
+    if (value === "" && (edited !== undefined || existing === undefined)) {
+      return;
+    }
+    params.push({ paramname, paramvalue: value });
+  };
+
+  for (const param of current) {
+    emit(param.paramname);
+  }
+  for (const field of fields) {
+    emit(field.key);
+  }
+  return { params, changes };
+}
+
+// The current value of each field, for editPropertiesViaQuickPick.
+function paramValueLookup(current: { paramname: string; paramvalue: string }[]): (key: string) => string {
+  const byName = new Map(current.map((param) => [param.paramname, String(param.paramvalue ?? "")]));
+  return (key) => byName.get(key) ?? "";
+}
+
+function buildAppParamFields(manifest: Manifest, current: AppParam[]): EditableFieldDef<string>[] {
+  const actions = (): FieldChoice[] => designElementChoices(manifest, ACTION_DESIGN_TYPE);
+  const pages = (): FieldChoice[] => designElementChoices(manifest, PAGE_DESIGN_TYPE);
+  const action = (key: string): EditableFieldDef<string> =>
+    choiceParamField(key, `Action to run for ${key}`, actions);
+
+  return appendUnknownParamFields(
+    [
+      action("OpenAction"),
+      action("OpenAction1"),
+      action("SaveAction"),
+      action("SaveAction1"),
+      choiceParamField("LoginPage", "Page to use as the login page", pages),
+      textParamField("DefaultOpen", "What the application opens by default"),
+      flagParamField("DisableApp", "Disable this application"),
+      flagParamField("DisableScheduledActions", "Disable this application's scheduled actions"),
+      {
+        ...choiceParamField("DefaultLocale", "Default locale for this application", localeChoices),
+        describe: localeLabel,
+      },
+      flagParamField("ForceSecureConn", "Force connections to this application over HTTPS"),
+    ],
+    current,
+  );
+}
+
+// Which design parameters a design element has depends on its type, mirroring
+// the server's own saveParams(): Pages additionally carry OpenAction,
+// SaveAction and ParentPage, while the three flags below apply to every type.
+function buildDesignParamFields(
+  manifest: Manifest,
+  designtype: number,
+  current: DesignParam[],
+): EditableFieldDef<string>[] {
+  const actions = (): FieldChoice[] => designElementChoices(manifest, ACTION_DESIGN_TYPE);
+  const pages = (): FieldChoice[] => designElementChoices(manifest, PAGE_DESIGN_TYPE);
+
+  const fields: EditableFieldDef<string>[] = [];
+  if (designtype === PAGE_DESIGN_TYPE) {
+    fields.push(
+      choiceParamField("OpenAction", "Action to run when this page is opened", actions),
+      choiceParamField("SaveAction", "Action to run when this page is saved", actions),
+      choiceParamField("ParentPage", "Page this page is nested inside", pages),
+    );
+  }
+  fields.push(
+    flagParamField("AnonymousAccess", "Allow access without logging in"),
+    flagParamField("MinifyLevel", "Minify this element"),
+    flagParamField("CompositeElement", "Treat this element as a composite element"),
+  );
+  return appendUnknownParamFields(fields, current);
+}
 
 // Shared by tornado.startWatching and tornado.refreshFromServer: lets the
 // user pick one of the applications already synced into this workspace.
@@ -1338,6 +1628,140 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
         } catch (error) {
           output.appendLine(`Failed to update application properties: ${(error as Error).message}`);
+          output.show(true);
+          vscode.window.showErrorMessage((error as Error).message);
+        }
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "tornado.editDesignElementParameters",
+      async (uri?: vscode.Uri) => {
+        const targetUri = uri ?? vscode.window.activeTextEditor?.document.uri;
+        if (!targetUri) {
+          vscode.window.showErrorMessage("Open or right-click a synced design element file first.");
+          return;
+        }
+        const located = await locateManifestEntry(targetUri);
+        if (!located) {
+          vscode.window.showErrorMessage(`"${targetUri.fsPath}" isn't a tracked Tornado design element.`);
+          return;
+        }
+        const { appFolder, manifest, entry } = located;
+        // SharedCode, Documentation and Widgets have no editable parameters.
+        // The Explorer's context menu already hides this command for them
+        // (see package.json), but the Command Palette route gets here with
+        // whatever file is in the active editor, so it's checked again.
+        if (!supportsDesignParams(entry.designtype)) {
+          const typeName = designTypeFolder(entry.designtype) ?? `design type ${entry.designtype}`;
+          vscode.window.showErrorMessage(
+            `"${entry.name}" is ${typeName} — design elements of that type have no editable parameters.`,
+          );
+          return;
+        }
+
+        try {
+          const { client } = await buildClientForConnection(context, output, manifest.connectionId);
+          // The element's parameters have their own endpoint, so this reads
+          // and writes just them — the element's content (designdata /
+          // designsource) is never fetched or re-sent, and so can't be
+          // clobbered by a parameter change.
+          const current = await client.fetchDesignParams(manifest.appid, entry.designbucketid);
+
+          const fields = buildDesignParamFields(manifest, entry.designtype, current);
+          const edits = await editPropertiesViaQuickPick(
+            `Parameters of "${entry.name}"`,
+            fields,
+            paramValueLookup(current),
+          );
+          if (!edits || Object.keys(edits).length === 0) {
+            return;
+          }
+
+          const { params: newParams, changes } = mergeParamEdits(current, fields, edits);
+          if (changes.length === 0) {
+            vscode.window.showInformationMessage("No design parameters were changed.");
+            return;
+          }
+
+          await client.updateDesignParams(manifest.appid, entry.designbucketid, newParams);
+
+          // Not optional bookkeeping: the watcher re-sends the *manifest's*
+          // designparams with every file upload (see appWatcher.ts), so
+          // leaving a stale copy here would silently revert what was just
+          // saved the next time the file is edited.
+          entry.designparams = newParams;
+          await writeManifestFile(appFolder, manifest);
+          await activeWatchers.get(appFolder.toString())?.reloadManifest();
+
+          for (const change of changes) {
+            output.appendLine(`  ${change}`);
+          }
+          output.appendLine(
+            `Updated ${changes.length} design parameter(s) of "${entry.name}" (id ${entry.designbucketid}).`,
+          );
+          vscode.window.showInformationMessage(
+            `Updated ${changes.length} parameter(s) of "${entry.name}" on the Tornado server.`,
+          );
+        } catch (error) {
+          output.appendLine(`Failed to update design parameters: ${(error as Error).message}`);
+          output.show(true);
+          vscode.window.showErrorMessage((error as Error).message);
+        }
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "tornado.editApplicationParameters",
+      async (uri?: vscode.Uri) => {
+        const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit parameters for"));
+        if (!folder) {
+          return;
+        }
+        const manifest = await readManifest(folder);
+        if (!manifest) {
+          vscode.window.showErrorMessage(`No manifest found in ${folder.fsPath}.`);
+          return;
+        }
+
+        try {
+          const { client } = await buildClientForConnection(context, output, manifest.connectionId);
+          const current = await client.fetchApplicationParams(manifest.appid);
+
+          const fields = buildAppParamFields(manifest, current);
+          const folderLabel = folder.fsPath.split("/").pop() ?? folder.fsPath;
+          const edits = await editPropertiesViaQuickPick(
+            `Application parameters — ${folderLabel}`,
+            fields,
+            paramValueLookup(current),
+          );
+          if (!edits || Object.keys(edits).length === 0) {
+            return;
+          }
+
+          const { params: newParams, changes } = mergeParamEdits(current, fields, edits);
+          if (changes.length === 0) {
+            vscode.window.showInformationMessage("No application parameters were changed.");
+            return;
+          }
+
+          await client.updateApplicationParams(manifest.appid, newParams);
+
+          for (const change of changes) {
+            output.appendLine(`  ${change}`);
+          }
+          output.appendLine(
+            `Updated ${changes.length} application parameter(s) for app ${manifest.appid}.`,
+          );
+          vscode.window.showInformationMessage(
+            `Updated ${changes.length} application parameter(s) on the Tornado server.`,
+          );
+        } catch (error) {
+          output.appendLine(`Failed to update application parameters: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }

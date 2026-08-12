@@ -80,8 +80,16 @@
         "title": "Tornado: Edit Design Element Properties"
       },
       {
+        "command": "tornado.editDesignElementParameters",
+        "title": "Tornado: Edit Design Element Parameters"
+      },
+      {
         "command": "tornado.editApplicationProperties",
         "title": "Tornado: Edit Application Properties"
+      },
+      {
+        "command": "tornado.editApplicationParameters",
+        "title": "Tornado: Edit Application Parameters"
       }
     ],
     "configuration": {
@@ -170,9 +178,19 @@
           "group": "7_modification@1"
         },
         {
+          "command": "tornado.editDesignElementParameters",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^\\/]+\\/(Pages|Resources|Actions)\\//",
+          "group": "7_modification@2"
+        },
+        {
           "command": "tornado.editApplicationProperties",
           "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\//",
           "group": "7_modification@1"
+        },
+        {
+          "command": "tornado.editApplicationParameters",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\//",
+          "group": "7_modification@2"
         }
       ],
       "view/title": [

@@ -20,6 +20,27 @@ export function folderToDesignType(folder: string): number | undefined {
   return FOLDER_DESIGN_TYPES[folder];
 }
 
+export function designTypeFolder(designtype: number): string | undefined {
+  return DESIGN_TYPE_FOLDERS[designtype];
+}
+
+// Design types whose elements have no editable parameters. The context-menu
+// "when" clause for tornado.editDesignElementParameters in package.json
+// spells out the *folders* of the types that do (Pages, Resources, Actions),
+// since a when clause can only match on the path — keep the two in sync. The
+// command itself re-checks with this, because the Command Palette route
+// (which uses the active editor's file) never runs that clause.
+const PARAMETERLESS_DESIGN_TYPES = new Set([
+  4, // SharedCode
+  5, // Documentation
+  6, // ScheduledActions
+  7, // Widgets
+]);
+
+export function supportsDesignParams(designtype: number): boolean {
+  return !PARAMETERLESS_DESIGN_TYPES.has(designtype);
+}
+
 const PAGE_DESIGN_TYPE = 1;
 
 // Only these three, per the Tornado application: Widgets are Java too in

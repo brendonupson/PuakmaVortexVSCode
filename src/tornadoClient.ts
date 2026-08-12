@@ -20,6 +20,51 @@ export interface DesignParam {
   paramvalue: string;
 }
 
+// An application-level parameter (APPPARAM) — same shape as DesignParam, but
+// scoped to the application rather than one of its design elements.
+export interface AppParam {
+  paramname: string;
+  paramvalue: string;
+}
+
+// The keys the two parameter collections are written under (see
+// updateApplicationParams / updateDesignParams). DESIGN_PARAMS_KEY matches
+// the field name design elements already use in their own JSON, rather than
+// the "params" of its URL.
+export const APP_PARAMS_KEY = "appparams";
+export const DESIGN_PARAMS_KEY = "designparams";
+
+// Pulls a parameter array out of whatever a params endpoint returns: an
+// object wrapping it under a key (what the PUTs send, and how the design
+// endpoint wraps its elements under "designelements"), or a bare top-level
+// array. Tolerant on read, exact on write. Exported for testability.
+export function extractParams<T extends AppParam | DesignParam>(body: unknown): T[] | undefined {
+  if (Array.isArray(body)) {
+    return body as T[];
+  }
+  if (!body || typeof body !== "object") {
+    return undefined;
+  }
+  const entries = Object.entries(body as Record<string, unknown>);
+  // Content first — an array of {paramname, paramvalue}-shaped objects is
+  // unambiguous. An empty array has nothing to shape-match, so fall back to
+  // an array-valued key whose name mentions "param".
+  for (const [, value] of entries) {
+    if (Array.isArray(value) && value.length > 0) {
+      const first = value[0] as Record<string, unknown> | null;
+      if (first && typeof first === "object" && "paramname" in first && "paramvalue" in first) {
+        return value as T[];
+      }
+    }
+  }
+  for (const [key, value] of entries) {
+    if (Array.isArray(value) && /param/i.test(key)) {
+      return value as T[];
+    }
+  }
+  return undefined;
+}
+
 export interface DesignElement {
   designbucketid: number;
   appid: number;
@@ -66,7 +111,18 @@ export class TornadoClient {
   private async request(path: string, init?: RequestInit): Promise<Response> {
     const url = `${this.serverUrl.replace(/\/$/, "")}${path}`;
     const method = init?.method ?? "GET";
-    this.output?.appendLine(`→ ${method} ${url}`);
+    // Log the request body's size (and, when it's small, the body itself) —
+    // "the server received no data" is otherwise indistinguishable from
+    // "the client sent none". Bodies here are either JSON or base64-encoded
+    // file content, so a size alone is enough for the big ones.
+    if (typeof init?.body === "string") {
+      const bytes = Buffer.byteLength(init.body);
+      this.output?.appendLine(
+        `→ ${method} ${url} — ${bytes} byte body` + (bytes <= 2000 ? `: ${init.body}` : ""),
+      );
+    } else {
+      this.output?.appendLine(`→ ${method} ${url}`);
+    }
 
     let response: Response;
     try {
@@ -156,6 +212,83 @@ export class TornadoClient {
     }
     this.output?.appendLine(`  ${body.designelements.length} design element(s) for app ${appid}`);
     return body;
+  }
+
+  // An application's APPPARAM key/value pairs, as their own collection
+  // alongside /vortex/{appid}/design — nothing else about the application is
+  // read or written through here, so editing a parameter can't disturb the
+  // app's own properties or its design elements.
+  async fetchApplicationParams(appid: number): Promise<AppParam[]> {
+    return this.fetchParams<AppParam>(`/vortex/${appid}/appparams`, `app ${appid}`);
+  }
+
+  async updateApplicationParams(appid: number, params: AppParam[]): Promise<void> {
+    await this.putParams(`/vortex/${appid}/appparams`, APP_PARAMS_KEY, params);
+  }
+
+  // A design element's own parameter collection, the design-element-level
+  // counterpart of /vortex/{appid}/appparams. Which parameter names belong
+  // to an element depends on its design type — see buildDesignParamFields()
+  // in extension.ts, which mirrors the server's saveParams().
+  async fetchDesignParams(appid: number, designbucketid: number): Promise<DesignParam[]> {
+    return this.fetchParams<DesignParam>(
+      `/vortex/${appid}/design/${designbucketid}/params`,
+      `design element ${designbucketid}`,
+    );
+  }
+
+  async updateDesignParams(
+    appid: number,
+    designbucketid: number,
+    params: DesignParam[],
+  ): Promise<void> {
+    await this.putParams(
+      `/vortex/${appid}/design/${designbucketid}/params`,
+      DESIGN_PARAMS_KEY,
+      params,
+    );
+  }
+
+  private async fetchParams<T extends AppParam | DesignParam>(
+    path: string,
+    subject: string,
+  ): Promise<T[]> {
+    const response = await this.request(path);
+    const body = (await response.json()) as unknown;
+    const params = extractParams<T>(body);
+    if (!params) {
+      const keys = body && typeof body === "object" ? Object.keys(body).join(", ") : typeof body;
+      this.output?.appendLine(`  Unexpected response shape — got: ${keys}`);
+      throw new Error(
+        `Expected an array of {paramname, paramvalue} for ${subject}, but got: ${keys}. ` +
+          "Check the Tornado output channel for the raw response.",
+      );
+    }
+    this.output?.appendLine(`  ${params.length} parameter(s) for ${subject}`);
+    return params;
+  }
+
+  // Replaces the whole set — parameters the editor drops (a flag turned off,
+  // a value cleared) are expressed by their absence from this array, so a
+  // partial write would silently fail to remove anything.
+  //
+  // Wrapped in an object rather than sent as a bare top-level array: a bare
+  // array is valid JSON and was verified to go out on the wire correctly
+  // (right Content-Type, right Content-Length), but the server read no data
+  // from it — a JSON parser expecting an object gets nothing from "[...]".
+  // Every other write in this API is an object, and the design endpoint's
+  // own responses wrap their list the same way ({"designelements": [...]}),
+  // so this matches the house style rather than working around it.
+  private async putParams(
+    path: string,
+    key: string,
+    params: (AppParam | DesignParam)[],
+  ): Promise<void> {
+    await this.request(path, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [key]: params }),
+    });
   }
 
   // Response shape (full created element, incl. new designbucketid) is

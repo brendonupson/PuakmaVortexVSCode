@@ -34,11 +34,52 @@ export interface AppParam {
 export const APP_PARAMS_KEY = "appparams";
 export const DESIGN_PARAMS_KEY = "designparams";
 
-// Pulls a parameter array out of whatever a params endpoint returns: an
-// object wrapping it under a key (what the PUTs send, and how the design
-// endpoint wraps its elements under "designelements"), or a bare top-level
-// array. Tolerant on read, exact on write. Exported for testability.
-export function extractParams<T extends AppParam | DesignParam>(body: unknown): T[] | undefined {
+// One value of a keyword's lookup list (KEYWORDDATA), named as the server
+// names its columns: "data" holds the value, "keywordorder" its position.
+// keyworddataid is absent on a row added in the editor and not yet saved —
+// the server assigns it.
+//
+// keywordorder is null when the row has no explicit position, which is the
+// default for a new row: unordered rows sort by their data. It is always
+// *sent* as an explicit null rather than by omitting the key, so the server
+// never has to tell "no order" apart from "field missing".
+export interface KeywordData {
+  keyworddataid?: number;
+  data: string;
+  keywordorder: number | null;
+}
+
+// An application's named lookup list (KEYWORD).
+export interface Keyword {
+  keywordid: number;
+  appid: number;
+  name: string;
+  description: string;
+  keyworddata: KeywordData[];
+}
+
+// keywordid doesn't exist yet — the POST body when creating a keyword, the
+// same way NewDesignElementPayload works for design elements.
+export type NewKeywordPayload = Omit<Keyword, "keywordid">;
+
+// Keyword bodies are wrapped under this key for the same reason the parameter
+// collections are: a bare top-level array goes out on the wire correctly but
+// the server reads no data from it.
+export const KEYWORD_KEY = "keyword";
+
+// Pulls an array out of whatever a collection endpoint returns: an object
+// wrapping it under a key (what the PUTs send, and how the design endpoint
+// wraps its elements under "designelements"), or a bare top-level array.
+// Tolerant on read, exact on write.
+//
+// Content first — an array whose first element has the expected fields is
+// unambiguous. An empty array has nothing to shape-match, so the second pass
+// falls back to the key's *name*, which is why callers pass a pattern too.
+function extractArray<T>(
+  body: unknown,
+  looksRight: (first: Record<string, unknown>) => boolean,
+  keyPattern: RegExp,
+): T[] | undefined {
   if (Array.isArray(body)) {
     return body as T[];
   }
@@ -46,21 +87,48 @@ export function extractParams<T extends AppParam | DesignParam>(body: unknown): 
     return undefined;
   }
   const entries = Object.entries(body as Record<string, unknown>);
-  // Content first — an array of {paramname, paramvalue}-shaped objects is
-  // unambiguous. An empty array has nothing to shape-match, so fall back to
-  // an array-valued key whose name mentions "param".
   for (const [, value] of entries) {
     if (Array.isArray(value) && value.length > 0) {
       const first = value[0] as Record<string, unknown> | null;
-      if (first && typeof first === "object" && "paramname" in first && "paramvalue" in first) {
+      if (first && typeof first === "object" && looksRight(first)) {
         return value as T[];
       }
     }
   }
   for (const [key, value] of entries) {
-    if (Array.isArray(value) && /param/i.test(key)) {
+    if (Array.isArray(value) && keyPattern.test(key)) {
       return value as T[];
     }
+  }
+  return undefined;
+}
+
+// Exported for testability.
+export function extractParams<T extends AppParam | DesignParam>(body: unknown): T[] | undefined {
+  return extractArray<T>(
+    body,
+    (first) => "paramname" in first && "paramvalue" in first,
+    /param/i,
+  );
+}
+
+export function extractKeywords(body: unknown): Keyword[] | undefined {
+  return extractArray<Keyword>(body, (first) => "name" in first && "keyworddata" in first, /keyword/i);
+}
+
+// A single keyword from a create response: the wrapped {"keyword": {...}} the
+// PUT/POST bodies use, or the bare object. Exported for testability.
+export function unwrapKeyword(body: unknown): Keyword | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return undefined;
+  }
+  const record = body as Record<string, unknown>;
+  if ("keywordid" in record || "name" in record) {
+    return record as unknown as Keyword;
+  }
+  const wrapped = record[KEYWORD_KEY];
+  if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) {
+    return wrapped as Keyword;
   }
   return undefined;
 }
@@ -83,6 +151,10 @@ export interface DesignElement {
 
 export interface ApplicationDesign {
   designelements: DesignElement[];
+  // Keywords ride along in the same app pull as the design elements — there's
+  // no separate read endpoint for them. Empty when the response carries no
+  // keyword array at all, which is not an error: an app can simply have none.
+  keywords: Keyword[];
 }
 
 // Same shape as a downloaded DesignElement, minus the server-managed audit
@@ -211,7 +283,32 @@ export class TornadoClient {
       );
     }
     this.output?.appendLine(`  ${body.designelements.length} design element(s) for app ${appid}`);
-    return body;
+
+    // Unlike designelements, a missing keyword array is not an error — an app
+    // can simply have none, and this response's main job is the design. It is
+    // logged, though: the alternative to a silent empty list is a keyword
+    // editor that looks empty because the array arrived under a name nothing
+    // recognises.
+    const keywords = extractKeywords(body);
+    if (keywords) {
+      this.output?.appendLine(`  ${keywords.length} keyword(s) for app ${appid}`);
+      // A keyword whose rows arrived under some other name would otherwise
+      // show up in the editor as simply having no values — and saving it
+      // would then write that emptiness back. Name the keys that did arrive.
+      for (const keyword of keywords) {
+        if (!Array.isArray(keyword.keyworddata)) {
+          this.output?.appendLine(
+            `  keyword "${keyword.name}" has no "keyworddata" array — keys present: ` +
+              `${Object.keys(keyword).join(", ")}. Its values will show as empty; do not save it.`,
+          );
+        }
+      }
+    } else {
+      this.output?.appendLine(
+        `  no keyword array in the response for app ${appid} — top-level keys: ${Object.keys(body).join(", ")}`,
+      );
+    }
+    return { ...body, keywords: keywords ?? [] };
   }
 
   // An application's APPPARAM key/value pairs, as their own collection
@@ -289,6 +386,71 @@ export class TornadoClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ [key]: params }),
     });
+  }
+
+  // An application's keywords (KEYWORD), each carrying its own value list
+  // (KEYWORDDATA) inline. There is no keyword *read* endpoint: they come down
+  // in the same app pull as the design elements, so this reuses that. Writes
+  // do have their own endpoints (below) — a rename and its row edits save
+  // together in one PUT rather than as two calls that can half-fail.
+  //
+  // Worth knowing: that app pull carries every design element's base64
+  // content, so this is a heavy request for a small amount of data. If
+  // reopening or saving in the keyword editor ever feels slow on a large
+  // application, a lightweight GET /vortex/{appid}/keywords is the fix.
+  async fetchKeywords(appid: number): Promise<Keyword[]> {
+    const design = await this.fetchApplicationDesign(appid);
+    return design.keywords;
+  }
+
+  // Fails loudly if the response omits the new keywordid, rather than leaving
+  // the editor holding a keyword it can't address on the next save — same
+  // guard as createDesignElement below.
+  async createKeyword(appid: number, payload: NewKeywordPayload): Promise<Keyword> {
+    const response = await this.request(`/vortex/${appid}/keywords`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [KEYWORD_KEY]: payload }),
+    });
+    // Read as text first so a failure can show what actually came back — a
+    // 200 with the wrong shape is otherwise invisible, since only non-2xx
+    // responses get their body logged.
+    const raw = await response.text();
+    let created: unknown;
+    try {
+      created = JSON.parse(raw);
+    } catch {
+      throw new Error(
+        `Tornado server's create-keyword response was not JSON. It replied ${response.status} with: ` +
+          `${raw.slice(0, 300) || "(an empty body)"}`,
+      );
+    }
+    const keyword = unwrapKeyword(created);
+    // A numeric string is accepted as well as a number: an id serialised from
+    // a Java long often arrives quoted, and rejecting "412" while accepting
+    // 412 would be a distinction without a difference here.
+    const keywordid = keyword === undefined ? undefined : Number(keyword.keywordid);
+    if (!keyword || keywordid === undefined || !Number.isFinite(keywordid)) {
+      throw new Error(
+        "Tornado server's create-keyword response did not include a numeric keywordid — cannot " +
+          `address this keyword for later edits. It replied ${response.status} with: ${raw.slice(0, 300)}`,
+      );
+    }
+    return { ...keyword, keywordid };
+  }
+
+  // The whole keyword, including every keyworddata row: the array replaces
+  // what's stored, so a deleted row is expressed by its absence.
+  async updateKeyword(appid: number, keywordid: number, keyword: Keyword): Promise<void> {
+    await this.request(`/vortex/${appid}/keywords/${keywordid}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [KEYWORD_KEY]: keyword }),
+    });
+  }
+
+  async deleteKeyword(appid: number, keywordid: number): Promise<void> {
+    await this.request(`/vortex/${appid}/keywords/${keywordid}`, { method: "DELETE" });
   }
 
   // Response shape (full created element, incl. new designbucketid) is

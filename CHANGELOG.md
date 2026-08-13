@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.0.4
+
+- New "Tornado: Edit Keywords" command (Command Palette or Explorer
+  right-click on a synced app folder): a webview panel — the first in this
+  extension — listing the application's keywords with New/Delete, and the
+  selected keyword's values as an editable table of `data`/`keywordorder`
+  rows. A row has no
+  `keywordorder` by default (sent as an explicit `null`) and sorts by its
+  `data`; rows given an order come first, in that order. Order numbers are
+  saved exactly as typed and never renumbered (↑/↓ swap two rows' order
+  values instead). The
+  50-row counter is a guide, not a save-blocking limit. Edits are kept per
+  keyword while the panel is open, so switching keywords doesn't discard work.
+  Keywords are read out of the existing app pull (`GET /vortex/{appid}/`,
+  alongside `designelements`, each keyword carrying its rows as
+  `keyworddata`); writes go to `POST /vortex/{appid}/keywords` and
+  `PUT`/`DELETE /vortex/{appid}/keywords/{keywordid}` with bodies wrapped as
+  `{"keyword": {...}}` — write endpoints that do not exist server-side yet.
 
 - New "Tornado: Edit Application Parameters" command (Command Palette or
   Explorer right-click on a synced app folder): edits an application's

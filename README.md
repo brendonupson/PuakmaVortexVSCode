@@ -302,6 +302,108 @@ are now implemented (with some deliberate gaps noted below). See the
   `tornadoClient.ts`): it takes that wrapped form, an object wrapping the
   array under any other key, or a bare array.
 
+- **Editing keywords** (`KEYWORD` / `KEYWORDDATA`, `keywordEditor.ts`):
+  `Tornado: Edit Keywords`, from the Command Palette or by right-clicking a
+  synced app's folder in the Explorer, opens **the extension's only webview** —
+  every other editor here is a QuickPick, which can't present a table of up to
+  50 value rows. One panel per application (a second invocation reveals the
+  open one rather than starting a rival editor with its own unsaved state):
+  keywords down the left with New/Delete, and the selected keyword's name plus
+  its value rows as an editable table on the right (each row is a `data`
+  value and its `keywordorder`, named as the server's columns are).
+
+  - **A row has no order by default.** `keywordorder` starts null on a new
+    row (the box shows a "by value" placeholder), and such rows sort by their
+    `data`. An order is something a user opts into for the rows they want
+    pinned. Clearing the box returns a row to unordered — it does *not* mean
+    zero, which is a real order like any other.
+  - Rows carrying an explicit order come first, in that order; the rest follow
+    sorted by `data`. Ties on order fall back to `data`. Sorting is applied on
+    load and after a save, never while typing, which would make rows jump
+    under the cursor.
+  - **Order values are preserved, never renumbered.** The order column is
+    saved exactly as typed, gaps and duplicates included. The ↑/↓ buttons
+    *swap the two rows' order values* rather than renumbering the list, so the
+    numbers only ever change as the direct result of an action. Rows that
+    share an order value — or that have no order to swap — therefore can't be
+    rearranged that way, and the panel says so instead of doing nothing.
+  - The `n of 50 rows` counter and the disabled "Add row" past 50 are a
+    **guide, not a limit**: nothing blocks a save on row count, so a keyword
+    that already holds more than 50 rows server-side stays editable.
+  - Edits are kept per keyword for as long as the panel is open, so switching
+    between keywords never discards work in progress; unsaved keywords carry a
+    dot in the list, Revert restores the last loaded copy, and closing the
+    panel with edits pending warns that they were discarded (a webview can't
+    veto its own close).
+  - Deleting a keyword goes through the same modal confirmation as deleting a
+    design element from the server. `description` isn't editable in the panel
+    but is carried through the save untouched, since the `PUT` replaces the
+    whole keyword.
+  - The panel holds no credentials and makes no requests: it exchanges
+    messages with the extension, which owns every HTTP call. Its
+    Content-Security-Policy allows one nonced inline script and inline styles
+    and nothing else — no network, no remote resources — and all of its
+    content is set through `textContent`/`value` rather than `innerHTML`.
+
+  **Reads come from the app pull; only writes have their own endpoints.**
+  Keywords arrive in the existing `GET /vortex/{appid}/` alongside
+  `designelements`, so there is no keyword read endpoint to build:
+
+  ```
+  GET    /vortex/{appid}/            (the existing app pull)
+    -> {..., "designelements": [...],
+        "keywords": [{"keywordid": 12, "appid": 7, "name": "Country",
+                      "description": "", "keyworddata": [
+                        {"keyworddataid": 88, "data": "AU", "keywordorder": 1},
+                        {"keyworddataid": 89, "data": "NZ", "keywordorder": null}]}]}
+
+  POST   /vortex/{appid}/keywords          body {"keyword": {...}} (no keywordid)
+                                           -> the created keyword, incl. its new keywordid
+  PUT    /vortex/{appid}/keywords/{kwid}   body {"keyword": {...}}
+  DELETE /vortex/{appid}/keywords/{kwid}
+  ```
+
+  **These three write endpoints did not exist server-side when this was
+  written** — the contract is as much a spec for the server as a client
+  implementation. The `PUT` sends the whole keyword: its `keyworddata` array
+  replaces what's stored, so a deleted row is expressed by its absence, and
+  rows carry `keyworddataid` only when they already exist. Bodies are wrapped
+  in an object for the same reason the parameter collections are.
+
+  **`keywordorder` is always present and is `null` when the row has no
+  explicit order** — the key is never omitted, so the server never has to
+  guess whether a missing field means "no order" or "leave it alone". Store
+  that null as SQL `NULL` (not `0`, which is a legitimate order a user can
+  type). On the read side the client accepts `null`, an absent key, or an
+  empty string as "no order", and coerces a numeric string to a number.
+
+  What the server must *reply*: only the `POST` response is parsed. It has to
+  be JSON (an empty 200 fails), either `{"keyword": {...}}` or the bare
+  object, carrying a `keywordid` — a number, or a numeric string, since an id
+  serialised from a Java long often arrives quoted. Nothing else in it is
+  required: the editor re-reads the app immediately afterwards, so
+  `{"keywordid": 412}` is enough. `PUT` and `DELETE` responses are never read
+  — any 2xx is success, an empty body is fine, and a non-2xx surfaces its
+  status plus the first 500 characters of its body. When a `POST` reply can't
+  be used, the error quotes the first 300 characters of what actually came
+  back, since a 200 with the wrong shape isn't otherwise logged.
+
+  The keyword array is located in the app pull by `extractKeywords()` — by
+  shape (objects with `name` and `keyworddata`, which `designelements` can't
+  satisfy) or by a keyword-ish key name, so it survives the exact key being
+  something other than `keywords`. A response with **no** keyword array is not
+  an error: an app can simply have none. A keyword whose rows arrive under
+  some *other* name (e.g. a pre-rename `values`) renders as a keyword with no
+  values and logs a line naming the keys it did see — **do not save such a
+  keyword**, since saving would write that emptiness back. Keywords are
+  fetched live and are never synced to disk or recorded in the manifest.
+
+  Note that the app pull carries every design element's base64 content, so
+  opening the editor (and each reload after a save) is a heavy request for a
+  small amount of data. If that ever bites on a large application, a
+  lightweight `GET /vortex/{appid}/keywords` is the fix — `fetchKeywords()` is
+  the only place that would change.
+
 - **Compiling and uploading Java** (`javaCompiler.ts`): `Tornado: Compile &
   Upload Java` batch-compiles all `.java` files under a synced app's
   Actions, SharedCode, and ScheduledActions folders together in one

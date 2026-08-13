@@ -35,6 +35,7 @@ import {
   writeManifestFile,
 } from "./designSync";
 import { AppWatcher } from "./appWatcher";
+import { openKeywordEditor } from "./keywordEditor";
 import { compileApp, ensureServerLibraries } from "./javaCompiler";
 import { ensureJavaIntelliSense } from "./javaIntellisense";
 
@@ -1633,6 +1634,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       },
     ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("tornado.editKeywords", async (uri?: vscode.Uri) => {
+      const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit keywords for"));
+      if (!folder) {
+        return;
+      }
+      const manifest = await readManifest(folder);
+      if (!manifest) {
+        vscode.window.showErrorMessage(`No manifest found in ${folder.fsPath}.`);
+        return;
+      }
+      try {
+        const { client } = await buildClientForConnection(context, output, manifest.connectionId);
+        await openKeywordEditor(folder, manifest.appid, client, output);
+      } catch (error) {
+        output.appendLine(`Failed to open the keyword editor: ${(error as Error).message}`);
+        output.show(true);
+        vscode.window.showErrorMessage((error as Error).message);
+      }
+    }),
   );
 
   context.subscriptions.push(

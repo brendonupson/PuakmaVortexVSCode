@@ -17,6 +17,7 @@ import {
   useSourceField,
   writeManifestFile,
 } from "./designSync";
+import { logError } from "./logging";
 
 export class AppWatcher implements vscode.Disposable {
   private readonly watcher: vscode.FileSystemWatcher;
@@ -69,7 +70,7 @@ export class AppWatcher implements vscode.Disposable {
     }
     fn().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
-      this.output.appendLine(`Unexpected watcher error: ${message}`);
+      logError(this.output, `Unexpected watcher error: ${message}`);
     });
   }
 
@@ -93,6 +94,12 @@ export class AppWatcher implements vscode.Disposable {
     }
 
     const relativePath = this.toRelativePath(uri);
+    // devconfig.json is a real Documentation element once the server has one,
+    // and is then tracked in the manifest like anything else — edits to it
+    // upload via handleChange. It's skipped only *here*, on create: reaching
+    // this point means it isn't in the manifest, i.e. the push in
+    // ensureDevConfig didn't succeed, and re-attempting it as an incidental
+    // file creation isn't this watcher's job.
     if (
       !relativePath ||
       relativePath === MANIFEST_FILENAME ||

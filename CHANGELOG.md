@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.0.5
+
+- Everything the extension logs is now mirrored to `console.log`, so it shows
+  up in the **Debug Console** when running under F5 (and in Help > Toggle
+  Developer Tools otherwise) instead of only in the Output panel, with a
+  timestamp on each line. Every command invocation is traced — what ran, what
+  it was aimed at, whether it finished, and how long it took.
+- **Failures are shown in red**: the "Tornado" channel is now a
+  `LogOutputChannel` and failures go through its `error()` level, while the
+  Debug Console mirror uses `console.error`. That covers failed
+  uploads/downloads (any non-2xx or network error from the server), compile
+  diagnostics from ecj, unexpected response shapes, watcher errors, and any
+  command that throws.
+- Fixed: design elements whose server-side name already carries an extension
+  (Resources, Documentation, Widgets) were written to disk with it doubled —
+  `Documentation/CLAUDE.md` became `CLAUDE.md.md`, a resource `style.css`
+  became `style.css.css`. The local filename is now derived by `fileNameFor()`
+  in `designSync.ts`, the exact inverse of `serverNameFor()`, so a
+  download/upload round trip leaves the server-side name untouched.
+- `Documentation/devconfig.json` is now a real design element rather than a
+  local-only file: it's pulled from the server when the application has one,
+  and when it doesn't, the default is written locally *and pushed* so everyone
+  syncing that app shares one configuration. Pushing is best-effort — a server
+  that rejects it leaves the local copy in place and logs why rather than
+  failing the sync.
+- Opening an app from the Inventory tree now replaces the local folder
+  instead of writing over the top of it, so elements deleted on the server
+  don't linger locally. A modal confirmation comes first when the folder
+  isn't empty, with "Delete & Sync Fresh", "Sync Without Deleting" (the
+  previous behaviour) and Cancel. The app's watcher is stopped before the
+  delete — otherwise it would treat the wipe as local deletions and ask
+  whether to delete each element from the server — and restarted afterwards;
+  the folder goes to the OS trash where supported; and
+  `Documentation/devconfig.json` is preserved across the replace.
+- Fixed: Tornado commands appeared in the Explorer context menu on folders
+  and files they can't act on, and failed with an error when used there. The
+  three application-level commands (Edit Application Properties/Parameters,
+  Edit Keywords) now appear only on an application's own root folder, not on
+  its design-type subfolders, `zbin/`, the shared `.lib/` cache, or
+  `tornado/` itself. Edit Design Element Properties now appears only on a
+  file actually inside a design-type folder, so it's no longer offered on
+  `CLAUDE.md`/`AGENTS.md`, `.tornado-manifest.json`, compiled `zbin/` output
+  or cached jars.
+
 ## 0.0.4
 
 - New "Tornado: Edit Keywords" command (Command Palette or Explorer

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { Keyword, KeywordData, NewKeywordPayload, TornadoClient } from "./tornadoClient";
+import { logError } from "./logging";
 
 // A guide, not a limit: the editor stops offering new rows past this, but a
 // keyword that already holds more is still perfectly editable and saveable.
@@ -167,7 +168,7 @@ export async function openKeywordEditor(
 
   const fail = async (action: string, error: unknown): Promise<void> => {
     const message = (error as Error).message;
-    output.appendLine(`Keyword ${action} failed: ${message}`);
+    logError(output, `Keyword ${action} failed: ${message}`);
     output.show(true);
     await panel.webview.postMessage({ type: "error", messages: [message] });
   };
@@ -178,7 +179,7 @@ export async function openKeywordEditor(
         try {
           await load();
         } catch (error) {
-          output.appendLine(`Could not load keywords: ${(error as Error).message}`);
+          logError(output, `Could not load keywords: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage(`Could not load keywords: ${(error as Error).message}`);
           panel.dispose();

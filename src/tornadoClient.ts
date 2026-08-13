@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { logError } from "./logging";
 
 export interface InventoryItem {
   appid: number;
@@ -207,13 +208,16 @@ export class TornadoClient {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.output?.appendLine(`✘ ${method} ${url} — network error: ${message}`);
+      logError(this.output, `✘ ${method} ${url} — network error: ${message}`);
       throw new Error(`Could not reach ${url}: ${message}`);
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      this.output?.appendLine(
+      // A failed upload or download — logged as an error so it stands out in
+      // red rather than scrolling past as one more line.
+      logError(
+        this.output,
         `✘ ${method} ${url} — ${response.status} ${response.statusText}` +
           (body ? `\n${body.slice(0, 2000)}` : ""),
       );
@@ -276,7 +280,7 @@ export class TornadoClient {
     const body = (await response.json()) as ApplicationDesign;
     if (!Array.isArray(body.designelements)) {
       const keys = body && typeof body === "object" ? Object.keys(body).join(", ") : typeof body;
-      this.output?.appendLine(`  Unexpected response shape — top-level keys: ${keys}`);
+      logError(this.output, `  Unexpected response shape — top-level keys: ${keys}`);
       throw new Error(
         `Expected a "designelements" array in the response for app ${appid}, but got: ${keys}. ` +
           "The response shape assumption may be wrong — check the Tornado output channel for the raw response.",
@@ -355,7 +359,7 @@ export class TornadoClient {
     const params = extractParams<T>(body);
     if (!params) {
       const keys = body && typeof body === "object" ? Object.keys(body).join(", ") : typeof body;
-      this.output?.appendLine(`  Unexpected response shape — got: ${keys}`);
+      logError(this.output, `  Unexpected response shape — got: ${keys}`);
       throw new Error(
         `Expected an array of {paramname, paramvalue} for ${subject}, but got: ${keys}. ` +
           "Check the Tornado output channel for the raw response.",

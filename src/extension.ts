@@ -25,7 +25,8 @@ import {
   Manifest,
   ManifestEntry,
   designTypeFolder,
-  extensionFor,
+  ensureDevConfig,
+  fileNameFor,
   inferContentType,
   isNestedJavaClassName,
   readManifest,
@@ -36,6 +37,7 @@ import {
 } from "./designSync";
 import { AppWatcher } from "./appWatcher";
 import { openKeywordEditor } from "./keywordEditor";
+import { createOutputChannel, logError, traceCommand } from "./logging";
 import { compileApp, ensureServerLibraries } from "./javaCompiler";
 import { ensureJavaIntelliSense } from "./javaIntellisense";
 
@@ -121,11 +123,23 @@ async function syncDesignToFolder(
   const design = await client.fetchApplicationDesign(appid);
   const existingWatcher = activeWatchers.get(appFolder.toString());
   output.appendLine(`Writing ${design.designelements.length} design element(s) to disk...`);
+  // devconfig.json is settled inside the same suppressed block: writing (and
+  // possibly pushing) it is part of the sync, not a local edit for the
+  // watcher to echo back.
+  const writeAll = async (): Promise<DesignSyncResult> => {
+    const written = await writeDesignElements(
+      appFolder,
+      appid,
+      connectionId,
+      design.designelements,
+      output,
+    );
+    await ensureDevConfig(appFolder, appid, client, written.manifest, output);
+    return written;
+  };
   const result = existingWatcher
-    ? await existingWatcher.runSuppressed(() =>
-        writeDesignElements(appFolder, appid, connectionId, design.designelements, output),
-      )
-    : await writeDesignElements(appFolder, appid, connectionId, design.designelements, output);
+    ? await existingWatcher.runSuppressed(writeAll)
+    : await writeAll();
   if (existingWatcher) {
     await existingWatcher.reloadManifest();
   }
@@ -147,7 +161,7 @@ async function syncDesignToFolder(
       );
     }
   } catch (error) {
-    output.appendLine(`Could not refresh server libraries: ${(error as Error).message}`);
+    logError(output, `Could not refresh server libraries: ${(error as Error).message}`);
   }
 
   return result;
@@ -291,6 +305,101 @@ async function compileAndUploadFolder(
   }
 
   return { uploaded, skipped, hadErrors: result.hadErrors, failedSourceNames: result.failedSourceNames };
+}
+
+type FolderResetChoice = "fresh" | "merge" | "cancel";
+
+// Opening an app from the Inventory tree replaces the local copy rather than
+// writing over the top of it — otherwise a design element deleted on the
+// server lingers locally forever, and a stale file can be uploaded back by
+// the watcher. Since that discards local work, it's confirmed first, and
+// only when there's actually something to discard.
+//
+// Returns what the caller should do next: "fresh" (folder is now empty —
+// sync into it), "merge" (leave it alone and write over the top, the old
+// behaviour), or "cancel".
+async function confirmAndResetAppFolder(
+  folder: vscode.Uri,
+  output: vscode.OutputChannel,
+  activeWatchers: Map<string, AppWatcher>,
+): Promise<FolderResetChoice> {
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(folder);
+  } catch {
+    // Brand new folder — nothing to delete, nothing to confirm.
+    return "fresh";
+  }
+  if (entries.length === 0) {
+    return "fresh";
+  }
+
+  const freshAction = "Delete & Sync Fresh";
+  const mergeAction = "Sync Without Deleting";
+  const choice = await vscode.window.showWarningMessage(
+    `Replace the local copy of this application at ${folder.fsPath}?`,
+    {
+      modal: true,
+      detail:
+        "Everything in that folder is deleted first, so the copy pulled down matches the server " +
+        "exactly. Local edits that haven't been uploaded will be lost, along with compiled output " +
+        "in zbin/. Documentation/devconfig.json is kept.\n\n" +
+        '"Sync Without Deleting" writes the server\'s copy over the top instead, leaving anything ' +
+        "the server no longer has in place.",
+    },
+    freshAction,
+    mergeAction,
+  );
+  if (choice === mergeAction) {
+    return "merge";
+  }
+  if (choice !== freshAction) {
+    return "cancel";
+  }
+
+  // devconfig.json is local dev-tooling config, not server design — it holds
+  // the per-app javaVersion override and is meant to survive re-syncing (see
+  // ensureDevConfig), so it's carried across the delete rather than reset to
+  // the default.
+  let devConfig: Uint8Array | undefined;
+  try {
+    devConfig = await vscode.workspace.fs.readFile(
+      vscode.Uri.joinPath(folder, DEV_CONFIG_RELATIVE_PATH),
+    );
+  } catch {
+    devConfig = undefined;
+  }
+
+  // Stop watching *before* deleting: the watcher treats a local delete as
+  // "the user removed this design element" and asks whether to delete it on
+  // the server too, which is the last thing a refresh should trigger.
+  // Suppression isn't enough — it lifts on a timer, and this can outlast it.
+  const key = folder.toString();
+  const watcher = activeWatchers.get(key);
+  if (watcher) {
+    watcher.dispose();
+    activeWatchers.delete(key);
+    output.appendLine(`Stopped watching ${folder.fsPath} while replacing it.`);
+  }
+
+  // Prefer the trash, so a mistaken confirmation is still recoverable from
+  // the OS. Not every filesystem supports it, hence the fallback.
+  try {
+    await vscode.workspace.fs.delete(folder, { recursive: true, useTrash: true });
+  } catch {
+    await vscode.workspace.fs.delete(folder, { recursive: true, useTrash: false });
+    output.appendLine("  (deleted permanently — the trash was unavailable)");
+  }
+  await vscode.workspace.fs.createDirectory(folder);
+  output.appendLine(`Deleted the local copy at ${folder.fsPath} before syncing a fresh one.`);
+
+  if (devConfig) {
+    const devConfigUri = vscode.Uri.joinPath(folder, DEV_CONFIG_RELATIVE_PATH);
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(devConfigUri, ".."));
+    await vscode.workspace.fs.writeFile(devConfigUri, devConfig);
+    output.appendLine(`  kept ${DEV_CONFIG_RELATIVE_PATH}`);
+  }
+  return "fresh";
 }
 
 // "/appgroup/appname" (appgroup dropped when empty, i.e. ungrouped) — used
@@ -715,9 +824,10 @@ async function pickSyncedAppFolder(placeHolder: string): Promise<vscode.Uri | un
 // up its ancestors looking for a synced app's manifest — a design element's
 // path is always exactly two levels under its app folder (<DesignTypeFolder>/
 // <file>), but walking rather than hardcoding that depth means this keeps
-// working if that ever changes. devconfig.json lives inside Documentation/
-// like a real design element but is dev tooling, not one — see designSync.ts
-// — so it's explicitly excluded rather than "found" with no matching entry.
+// working if that ever changes. devconfig.json is excluded even though it is
+// now a real Documentation element on the server: it's the extension's own
+// configuration, and renaming or re-pointing it through the design-element
+// property editors would only break the lookup that reads it.
 async function locateManifestEntry(
   uri: vscode.Uri,
 ): Promise<{ appFolder: vscode.Uri; manifest: Manifest; entry: ManifestEntry } | undefined> {
@@ -746,9 +856,19 @@ async function locateManifestEntry(
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const output = vscode.window.createOutputChannel("Tornado");
+  const output = createOutputChannel();
   context.subscriptions.push(output);
+  output.appendLine("Tornado extension activated.");
   const activeWatchers = new Map<string, AppWatcher>();
+
+  // Every command goes through traceCommand, so the log shows what ran, what
+  // it was aimed at, and whether it finished — not just the milestones each
+  // command chooses to report.
+  const registerTracedCommand = (
+    id: string,
+    handler: (...args: never[]) => unknown,
+  ): vscode.Disposable =>
+    vscode.commands.registerCommand(id, traceCommand(output, id, handler as (...args: unknown[]) => unknown));
 
   context.subscriptions.push(
     vscode.window.registerFileDecorationProvider({
@@ -793,7 +913,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   treeProvider.setClient(await buildClient(context, output));
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.addConnection", async () => {
+    registerTracedCommand("tornado.addConnection", async () => {
       const name = await vscode.window.showInputBox({
         prompt: "Connection name",
         placeHolder: "e.g. Dev, Staging, Production", 
@@ -842,7 +962,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.selectConnection", async () => {
+    registerTracedCommand("tornado.selectConnection", async () => {
       const connections = getConnections();
       if (connections.length === 0) {
         vscode.window.showInformationMessage(
@@ -875,7 +995,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.editConnection", async () => {
+    registerTracedCommand("tornado.editConnection", async () => {
       const connections = getConnections();
       if (connections.length === 0) {
         vscode.window.showInformationMessage("No Tornado connections configured.");
@@ -955,7 +1075,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.deleteConnection", async () => {
+    registerTracedCommand("tornado.deleteConnection", async () => {
       const connections = getConnections();
       if (connections.length === 0) {
         vscode.window.showInformationMessage("No Tornado connections configured.");
@@ -995,7 +1115,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.refreshInventory", async () => {
+    registerTracedCommand("tornado.refreshInventory", async () => {
       try {
         treeProvider.setClient(await buildClient(context, output));
       } catch (error) {
@@ -1005,7 +1125,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
+    registerTracedCommand(
       "tornado.syncApplication",
       async (selected?: InventoryItem) => {
         const connection = getActiveConnection(context);
@@ -1058,7 +1178,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return;
           }
 
+          // Captured before the reset below, which tears the watcher down so
+          // its delete handler can't mistake the wipe for the user removing
+          // design elements. Restarted after the sync if it was running.
           const wasWatching = activeWatchers.has(folder.toString());
+          const reset = await confirmAndResetAppFolder(folder, output, activeWatchers);
+          if (reset === "cancel") {
+            output.appendLine(`Sync of "${app.appname}" cancelled — the local copy was left alone.`);
+            return;
+          }
+
           const appid = app.appid;
           const result = await vscode.window.withProgress(
             {
@@ -1069,6 +1198,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
 
           if (wasWatching) {
+            // Only ever stopped by the reset path; restart it so "opening"
+            // an app that was being watched doesn't quietly stop watching it.
+            if (!activeWatchers.has(folder.toString())) {
+              await startWatchingFolder(context, output, activeWatchers, folder);
+              output.appendLine(`Resumed watching ${folder.fsPath}.`);
+            }
             vscode.window.showInformationMessage(
               `Synced ${result.written} design element(s) to ${folder.fsPath}`,
             );
@@ -1084,7 +1219,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
           }
         } catch (error) {
-          output.appendLine(`Sync failed: ${(error as Error).message}`);
+          logError(output, `Sync failed: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }
@@ -1093,7 +1228,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.createApplication", async () => {
+    registerTracedCommand("tornado.createApplication", async () => {
       const connection = getActiveConnection(context);
       if (!connection) {
         vscode.window.showErrorMessage(
@@ -1152,7 +1287,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const { client } = await buildClientForConnection(context, output, connection.id);
         created = await client.createApplication(payload);
       } catch (error) {
-        output.appendLine(`Failed to create application: ${(error as Error).message}`);
+        logError(output, `Failed to create application: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
         return;
@@ -1187,7 +1322,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
         }
       } catch (error) {
-        output.appendLine(`Local sync of the new application failed: ${(error as Error).message}`);
+        logError(output, `Local sync of the new application failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showWarningMessage(
           `Created "${created.appname}" (id ${created.appid}) on the Tornado server, but syncing it ` +
@@ -1199,7 +1334,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.startWatching", async () => {
+    registerTracedCommand("tornado.startWatching", async () => {
       const folder = await pickSyncedAppFolder("Select a synced application to watch");
       if (!folder) {
         return;
@@ -1214,7 +1349,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.refreshFromServer", async () => {
+    registerTracedCommand("tornado.refreshFromServer", async () => {
       const folder = await pickSyncedAppFolder("Select an application to refresh from the server");
       if (!folder) {
         return;
@@ -1249,7 +1384,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           `Refreshed ${result.written} design element(s) in ${folder.fsPath}`,
         );
       } catch (error) {
-        output.appendLine(`Refresh failed: ${(error as Error).message}`);
+        logError(output, `Refresh failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
       }
@@ -1257,7 +1392,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.stopWatching", async () => {
+    registerTracedCommand("tornado.stopWatching", async () => {
       if (activeWatchers.size === 0) {
         vscode.window.showInformationMessage("No Tornado applications are currently being watched.");
         return;
@@ -1281,7 +1416,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.compileAndUpload", async () => {
+    registerTracedCommand("tornado.compileAndUpload", async () => {
       const folder = await pickSyncedAppFolder("Select an application to compile and upload");
       if (!folder) {
         return;
@@ -1299,7 +1434,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           vscode.window.showInformationMessage(message);
         }
       } catch (error) {
-        output.appendLine(`Compile & upload failed: ${(error as Error).message}`);
+        logError(output, `Compile & upload failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
       }
@@ -1307,7 +1442,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.refreshServerLibraries", async () => {
+    registerTracedCommand("tornado.refreshServerLibraries", async () => {
       const folder = await pickSyncedAppFolder("Select an application to refresh server libraries for");
       if (!folder) {
         return;
@@ -1329,7 +1464,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await ensureJavaIntelliSense(output);
         vscode.window.showInformationMessage(`Refreshed server libraries for "${connectionName}".`);
       } catch (error) {
-        output.appendLine(`Refreshing server libraries failed: ${(error as Error).message}`);
+        logError(output, `Refreshing server libraries failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
       }
@@ -1337,7 +1472,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
+    registerTracedCommand(
       "tornado.editDesignElementProperties",
       async (uri?: vscode.Uri) => {
         const targetUri = uri ?? vscode.window.activeTextEditor?.document.uri;
@@ -1455,15 +1590,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           const existingWatcher = activeWatchers.get(appFolder.toString());
           if (newName !== oldName) {
-            // Same computation writeDesignElements uses for the download
-            // direction (folder + name + extensionFor, or ".class" for a
-            // nested Java class) — keeps the local filename in sync with
-            // what the next refresh-from-server would produce anyway.
+            // The same fileNameFor() writeDesignElements uses for the
+            // download direction — keeps the local filename in step with what
+            // the next refresh-from-server would produce anyway.
             const folderPart = oldPath.slice(0, oldPath.lastIndexOf("/"));
-            const nestedClass = isNestedJavaClassName(entry.designtype, newName);
-            const newFileName = nestedClass
-              ? `${newName}.class`
-              : `${newName}${extensionFor(entry.designtype, entry.contenttype)}`;
+            const newFileName = fileNameFor(newName, entry.designtype, entry.contenttype);
             const newPath = `${folderPart}/${newFileName}`;
             entry.path = newPath;
 
@@ -1514,7 +1645,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             vscode.window.showInformationMessage(`Updated "${newName}" on the Tornado server.`);
           }
         } catch (error) {
-          output.appendLine(`Failed to update design element properties: ${(error as Error).message}`);
+          logError(output, `Failed to update design element properties: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }
@@ -1523,7 +1654,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
+    registerTracedCommand(
       "tornado.editApplicationProperties",
       async (uri?: vscode.Uri) => {
         const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit properties for"));
@@ -1628,7 +1759,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               : `Updated "${newAppName}" on the Tornado server.`,
           );
         } catch (error) {
-          output.appendLine(`Failed to update application properties: ${(error as Error).message}`);
+          logError(output, `Failed to update application properties: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }
@@ -1637,7 +1768,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tornado.editKeywords", async (uri?: vscode.Uri) => {
+    registerTracedCommand("tornado.editKeywords", async (uri?: vscode.Uri) => {
       const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit keywords for"));
       if (!folder) {
         return;
@@ -1651,7 +1782,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const { client } = await buildClientForConnection(context, output, manifest.connectionId);
         await openKeywordEditor(folder, manifest.appid, client, output);
       } catch (error) {
-        output.appendLine(`Failed to open the keyword editor: ${(error as Error).message}`);
+        logError(output, `Failed to open the keyword editor: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
       }
@@ -1659,7 +1790,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
+    registerTracedCommand(
       "tornado.editDesignElementParameters",
       async (uri?: vscode.Uri) => {
         const targetUri = uri ?? vscode.window.activeTextEditor?.document.uri;
@@ -1729,7 +1860,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             `Updated ${changes.length} parameter(s) of "${entry.name}" on the Tornado server.`,
           );
         } catch (error) {
-          output.appendLine(`Failed to update design parameters: ${(error as Error).message}`);
+          logError(output, `Failed to update design parameters: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }
@@ -1738,7 +1869,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
+    registerTracedCommand(
       "tornado.editApplicationParameters",
       async (uri?: vscode.Uri) => {
         const folder = uri ?? (await pickSyncedAppFolder("Select an application to edit parameters for"));
@@ -1784,7 +1915,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             `Updated ${changes.length} application parameter(s) on the Tornado server.`,
           );
         } catch (error) {
-          output.appendLine(`Failed to update application parameters: ${(error as Error).message}`);
+          logError(output, `Failed to update application parameters: ${(error as Error).message}`);
           output.show(true);
           vscode.window.showErrorMessage((error as Error).message);
         }
@@ -1832,7 +1963,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     } catch (error) {
-      output.appendLine(`Auto-compile failed: ${(error as Error).message}`);
+      logError(output, `Auto-compile failed: ${(error as Error).message}`);
       output.show(true);
       vscode.window.showErrorMessage(`Tornado auto-compile failed: ${(error as Error).message}`);
     } finally {

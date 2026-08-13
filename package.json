@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Tornado Extension",
   "description": "Develop applications on the Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -178,27 +178,27 @@
       "explorer/context": [
         {
           "command": "tornado.editDesignElementProperties",
-          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\/tornado\\// && resourceFilename != devconfig.json",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*\\/(?!zbin\\/)[^.\\/][^\\/]*\\/[^\\/]+$/ && resourceFilename != devconfig.json",
           "group": "7_modification@1"
         },
         {
           "command": "tornado.editDesignElementParameters",
-          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^\\/]+\\/(Pages|Resources|Actions)\\//",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*\\/(Pages|Resources|Actions)\\/[^\\/]+$/",
           "group": "7_modification@2"
         },
         {
           "command": "tornado.editApplicationProperties",
-          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\//",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*$/",
           "group": "7_modification@1"
         },
         {
           "command": "tornado.editApplicationParameters",
-          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\//",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*$/",
           "group": "7_modification@2"
         },
         {
           "command": "tornado.editKeywords",
-          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\//",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*$/",
           "group": "7_modification@3"
         }
       ],

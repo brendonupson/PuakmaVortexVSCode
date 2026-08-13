@@ -11,12 +11,31 @@ are now implemented (with some deliberate gaps noted below). See the
 ## Status
 
 - **Diagnostics**: every HTTP request `TornadoClient` makes (method, full
-  URL, response status, and — on failure — the response body) is logged to
-  the **"Tornado" output channel** (View → Output, select "Tornado" from
-  the dropdown), along with sync milestones (files written, byte counts,
-  skipped uploads and why). It auto-opens on a sync failure. If a sync
+  URL, request body size — and the body itself when under 2KB — response
+  status, and on failure the response body) is logged to the **"Tornado"
+  output channel** (View → Output, select "Tornado" from the dropdown), along
+  with sync milestones (files written, byte counts, skipped uploads and why)
+  and a trace of every command: what ran, what it was aimed at, whether it
+  finished, and how long it took. It auto-opens on a sync failure. If a sync
   seems to do nothing, check there first before assuming it's silent — it
   isn't.
+
+  **Failures appear in red.** The channel is a `LogOutputChannel`
+  (`logging.ts`), so ordinary progress is logged at info level and anything
+  that failed goes through `error()`, which the Output panel renders in red:
+  failed uploads and downloads (any non-2xx or network error), ecj's compile
+  diagnostics, unexpected response shapes, watcher errors, and any command
+  that throws. `logError()` is the one entry point for that, and falls back to
+  a plain line if handed a channel that isn't one of ours.
+
+  **The same stream is mirrored to `console.log`/`console.error`**, timestamped
+  and prefixed with `[Tornado]` — which is where the **Debug Console** shows it
+  when the extension is run with F5, and Help → Toggle Developer Tools shows it
+  in a normal install. So a debugging session sees extension activity
+  interleaved with its own breakpoints and stack traces without switching to
+  the Output panel. Only what's already written to the channel is mirrored:
+  design element *contents* (base64) are never logged, just names and byte
+  counts.
 - **File editing**: CSS, JS, HTML, XML, XSL, plain text, and Java are all
   covered by VS Code's built-in language support — no custom language
   contribution needed. If Tornado stores design elements under non-standard
@@ -62,7 +81,30 @@ are now implemented (with some deliberate gaps noted below). See the
   `tornado/<connectionName>_<appgroup>_<appname>/` in the open workspace
   (appgroup is optional and dropped when empty), fetches its full design via
   `GET /vortex/{appid}/` with HTTP Basic Auth, and writes each element from
-  the response's `designelements` array to disk (`designSync.ts`). If no
+  the response's `designelements` array to disk (`designSync.ts`).
+
+  **Opening an app that's already synced replaces the local copy rather than
+  writing over the top of it**, so what lands on disk matches the server
+  exactly — otherwise an element deleted on the server lingers locally
+  forever, and the watcher could upload a stale file back. Because that
+  discards local work, a modal confirmation comes first
+  (`confirmAndResetAppFolder()` in `extension.ts`), offering **Delete & Sync
+  Fresh**, **Sync Without Deleting** (the older write-over-the-top behaviour,
+  for when there's local work to keep) and Cancel. It only appears when the
+  folder actually has something in it — a first sync, or a re-sync into an
+  empty folder, goes straight through.
+
+  Three things that matter on the delete path: the app's **watcher is
+  disposed before anything is removed** (its delete handler treats a vanished
+  file as "the user deleted this design element" and asks whether to delete it
+  server-side too, which is the last thing a refresh should trigger) and
+  restarted afterwards if it was running; the folder goes to the **OS trash**
+  where the filesystem supports it, falling back to a permanent delete; and
+  **`Documentation/devconfig.json` is carried across**, since the per-app
+  `javaVersion` override is local dev-tooling config rather than server design
+  and is meant to survive re-syncing. `zbin/` compiled output is not
+  preserved — the next compile rebuilds it. `Tornado: Refresh from Server` is
+  unchanged and still writes over the top without deleting. If no
   folder is open, the error offers an "Open Folder..." button
   (`vscode.openFolder`) instead of a dead end — note that opening a folder
   reloads the window, so the sync has to be retried afterward rather than
@@ -84,7 +126,17 @@ are now implemented (with some deliberate gaps noted below). See the
   `contenttype == "application/java-archive"`) decodes `designdata` instead
   — Pages get a `.phtml` extension rather than `.html`, since Tornado pages
   mix in non-standard tags that would mislead HTML tooling; other types get
-  an extension guessed from `contenttype`. A `.tornado-manifest.json` is
+  an extension guessed from `contenttype`.
+
+  **An extension is only ever *added* to the design types whose server-side
+  name is bare** (Pages, Actions, SharedCode, ScheduledActions). Resources,
+  Documentation and Widgets already carry theirs in the name, so the name *is*
+  the filename — otherwise `Documentation/CLAUDE.md` lands as `CLAUDE.md.md`.
+  `fileNameFor()` in `designSync.ts` is the single place that decides this,
+  used by both the download and the rename path, and is the exact inverse of
+  `serverNameFor()` — which is what stops a round trip from quietly renaming
+  an element (adding `.md` to a Documentation element named `notes` would
+  push it back as a rename to `notes.md`). A `.tornado-manifest.json` is
   written alongside each app's files (`designSync.ts`) recording each
   element's `designbucketid`/name/type/contenttype/etc. plus which
   connection it came from — the extension host restarts when a folder is
@@ -171,7 +223,17 @@ are now implemented (with some deliberate gaps noted below). See the
   (`designdata`/`designsource`) and `designparams` aren't touched, and are
   re-sent exactly as fetched fresh from the server rather than reconstructed
   from the local file, so a Java element's compiled bytecode (`designdata`)
-  is never overwritten with its source text by accident. Renaming:
+  is never overwritten with its source text by accident.
+
+  The Explorer entry is offered only on a file that is actually inside a
+  design-type folder (`tornado/<app>/<TypeFolder>/<file>`, including a
+  `Type<N>/` folder for a design type this extension doesn't know by name).
+  It stays off `CLAUDE.md`/`AGENTS.md`, `.tornado-manifest.json`,
+  `Documentation/devconfig.json`, compiled `zbin/` output and the cached
+  `.lib/` jars — none of which is a tracked design element, so offering the
+  command there could only ever end in an error.
+
+  Renaming:
   - Updates the server via the same `PUT` used elsewhere, then renames the
     local file to match (via a `WorkspaceEdit`, so any editor with it open
     follows) and updates the manifest — suppressing the app's watcher around
@@ -245,9 +307,18 @@ are now implemented (with some deliberate gaps noted below). See the
   would suggest re-running the command (which would create a duplicate
   application server-side).
 
+- **The three application-level commands** — `Edit Application Properties`,
+  `Edit Application Parameters` and `Edit Keywords` — appear in the Explorer
+  context menu **only on an application's own root folder**
+  (`tornado/<app>`), never on the design-type subfolders inside it, on
+  `zbin/`, on the shared `.lib/` cache, or on `tornado/` itself. Those have no
+  manifest to act on, so the commands could only fail there. The Command
+  Palette route is unaffected: it offers a picker of synced applications
+  (`pickSyncedAppFolder()`).
+
 - **Editing application properties**: `Tornado: Edit Application
   Properties`, from the Command Palette (offers a picker of synced apps) or
-  by right-clicking a synced app's folder in the Explorer, edits the
+  by right-clicking a synced app's root folder in the Explorer, edits the
   application itself rather than one of its design elements —
   `appname`/`appgroup`/`description`/`templatename`/`inheritfrom`.
   `appdisplayname` and `appversion` are read (used in the picker's title and
@@ -460,26 +531,41 @@ are now implemented (with some deliberate gaps noted below). See the
   use. This is a one-way copy, not a design element: re-run on every sync/
   compile/refresh (not only when the zip is freshly downloaded), so a local
   edit is silently overwritten the next time round. The watcher explicitly
-  skips both filenames (`AGENT_INSTRUCTION_FILENAMES` in `designSync.ts`,
-  same treatment as `devconfig.json`), so neither is ever uploaded.
+  skips both filenames (`AGENT_INSTRUCTION_FILENAMES` in `designSync.ts`), so
+  neither is ever uploaded. These are the app-root copies — a `CLAUDE.md` that
+  exists as a Documentation *design element* on the server is a different
+  thing, synced to `Documentation/CLAUDE.md` like any other element.
 
   The `java` launcher used to run `ecj` is located via `tornado.javaHome`
   (a setting, empty by default), then `$JAVA_HOME`, then `java` on `PATH`.
   Compiled bytecode's target version (`--release`) comes from
-  **`Documentation/devconfig.json`**
-  (`{ "javaVersion": "..." }`) — created automatically on every sync (initial
-  and refresh) if it doesn't already exist yet, seeded with the current
-  `tornado.javaRelease` setting's value (default `"8"`, a conservative
-  floor), and left untouched on every subsequent sync once it exists — so
-  it's a per-app override that survives re-syncing. `tornado.javaRelease`
-  itself is only the fallback when `devconfig.json` is missing or doesn't
-  set `javaVersion`. This exists because the server doesn't expose the Java
-  version it expects via REST the way `vortex-cli-mirror` reads it over
+  **`Documentation/devconfig.json`** (`{ "javaVersion": "..." }`).
+  `tornado.javaRelease` is only the fallback when that file is missing or
+  doesn't set `javaVersion`. This exists because the server doesn't expose the
+  Java version it expects via REST the way `vortex-cli-mirror` reads it over
   SOAP; adjust the per-app file if compilation rejects the release, or if
-  uploaded classes fail to load on the server. Despite living inside
-  `Documentation/`, `devconfig.json` is dev tooling config, not a design
-  element — it's never added to the manifest and the watcher explicitly
-  ignores it, so it's never uploaded.
+  uploaded classes fail to load on the server.
+
+  **`devconfig.json` is a real Documentation design element, stored on the
+  server** (`ensureDevConfig()` in `designSync.ts`), so a whole team shares
+  one per-app configuration instead of each checkout inventing its own:
+
+  - When the application has one, it arrives with the rest of the design like
+    any other element, lands in the manifest, and is never overwritten with a
+    local default.
+  - When it doesn't, the default (seeded from `tornado.javaRelease`, default
+    `"8"`, a conservative floor) is written locally **and pushed to the
+    server** as a new Documentation element, with the new `designbucketid`
+    recorded in the manifest.
+  - That push is best-effort: a server that rejects it (no permission, or an
+    older build) leaves the local copy in place and logs the reason to the
+    Tornado output channel rather than failing the sync.
+  - Once tracked, local edits upload like any other element. The watcher skips
+    it only on *create*, which is reached only when the push didn't succeed —
+    retrying that as an incidental file creation isn't the watcher's job. It's
+    also kept out of the design-element property editors: it's the extension's
+    own configuration, and renaming it would just break the lookup that reads
+    it.
 
   After compiling, each resulting top-level class is matched back to its
   manifest entry by class name and uploaded via the same

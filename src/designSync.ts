@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
-import { DesignElement, DesignParam } from "./tornadoClient";
+import { DesignElement, DesignParam, NewDesignElementPayload, TornadoClient } from "./tornadoClient";
 import { assertSafePathSegment } from "./workspaceStorage";
+import { logError } from "./logging";
 
 const DESIGN_TYPE_FOLDERS: Record<number, string> = {
   1: "Pages",
@@ -100,6 +101,37 @@ export function extensionFor(designtype: number, contenttype: string): string {
     return ".phtml";
   }
   return MIME_EXTENSIONS[ctype] ?? guessExtension(ctype);
+}
+
+// The local filename for a design element — the exact inverse of
+// serverNameFor(), which is what makes a download/upload round trip leave the
+// server-side name untouched.
+//
+// Resources, Documentation and Widgets carry their extension in the
+// server-side name already (see BARE_NAME_DESIGN_TYPES), so the name *is* the
+// filename. Appending extensionFor() to those unconditionally is what
+// produced "CLAUDE.md.md" and "style.css.css". It's equally wrong to append
+// one to an extension-less name of those types: a Documentation element named
+// "notes" would become "notes.md" locally, and the next upload would push
+// that back as a *rename* to "notes.md" server-side.
+//
+// For the bare-name types the extension is ours to add, but it's still
+// skipped when the name already ends in it — a SharedCode "thing.jar" must
+// not become "thing.jar.jar".
+export function fileNameFor(name: string, designtype: number, contenttype: string): string {
+  // A nested/inner class is bytecode only, never a source file — see
+  // isNestedJavaClassName.
+  if (isNestedJavaClassName(designtype, name)) {
+    return `${name}.class`;
+  }
+  if (!BARE_NAME_DESIGN_TYPES.has(designtype)) {
+    return name;
+  }
+  const ext = extensionFor(designtype, contenttype);
+  if (!ext || name.toLowerCase().endsWith(ext.toLowerCase())) {
+    return name;
+  }
+  return `${name}${ext}`;
 }
 
 // Inverse of extensionFor(), used when a brand-new local file has to be
@@ -208,12 +240,16 @@ export async function writeManifestFile(appFolder: vscode.Uri, manifest: Manifes
   await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(appFolder, MANIFEST_FILENAME), bytes);
 }
 
-// Lives in Documentation for discoverability, but is dev-tooling config, not
-// a real design element — never written to the manifest, and explicitly
-// skipped by the watcher (see appWatcher.ts) so it's never uploaded.
+// A real Documentation design element that lives on the server like any
+// other, so a team shares one per-app dev configuration rather than each
+// checkout inventing its own. Pulled down by the normal sync when the server
+// has it; created locally *and pushed* the first time an app doesn't (see
+// ensureDevConfig).
 const DEV_CONFIG_FOLDER = "Documentation";
 const DEV_CONFIG_FILENAME = "devconfig.json";
 export const DEV_CONFIG_RELATIVE_PATH = `${DEV_CONFIG_FOLDER}/${DEV_CONFIG_FILENAME}`;
+const DEV_CONFIG_DESIGN_TYPE = 5; // Documentation
+const DEV_CONFIG_CONTENT_TYPE = "application/json";
 
 // Mirrored into the app folder root from the shared libraries zip (see
 // copyAgentInstructionFiles in javaCompiler.ts) — a one-way copy, not a
@@ -229,21 +265,77 @@ export interface DevConfig {
   javaVersion: string;
 }
 
-// Called on every sync (initial and refresh) — only creates the file the
-// first time; an existing one is left untouched, since it's where a
-// per-app override lives once someone has set it.
-export async function ensureDevConfig(appFolder: vscode.Uri, output?: vscode.OutputChannel): Promise<void> {
-  const uri = vscode.Uri.joinPath(appFolder, DEV_CONFIG_FOLDER, DEV_CONFIG_FILENAME);
-  try {
-    await vscode.workspace.fs.stat(uri);
+// Called on every sync (initial and refresh), after the design has been
+// written to disk.
+//
+// When the server has a devconfig.json it arrives as an ordinary
+// Documentation element and is already on disk and in the manifest by the
+// time this runs — nothing to do, and in particular the server's copy is
+// never overwritten with a local default. When it doesn't, a default is
+// written locally *and pushed to the server*, so the next person to sync the
+// app gets the same configuration instead of silently generating their own.
+//
+// The push is best-effort: a server that rejects it (no permission, or an
+// older build) leaves the local file in place and logs why, because a dev
+// config is not worth failing a sync over.
+export async function ensureDevConfig(
+  appFolder: vscode.Uri,
+  appid: number,
+  client: TornadoClient,
+  manifest: Manifest,
+  output?: vscode.OutputChannel,
+): Promise<void> {
+  const existing = manifest.elements.find((entry) => entry.path === DEV_CONFIG_RELATIVE_PATH);
+  if (existing) {
+    output?.appendLine(`  ${DEV_CONFIG_RELATIVE_PATH} came from the server (id ${existing.designbucketid})`);
     return;
-  } catch {
-    // Doesn't exist yet — fall through and create it.
   }
+
   const javaVersion = vscode.workspace.getConfiguration("tornado").get<string>("javaRelease", "8");
   const config: DevConfig = { javaVersion };
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(config, null, 2), "utf-8"));
-  output?.appendLine(`  wrote ${DEV_CONFIG_RELATIVE_PATH} (default javaVersion: ${javaVersion})`);
+  const contents = Buffer.from(JSON.stringify(config, null, 2), "utf-8");
+  const uri = vscode.Uri.joinPath(appFolder, DEV_CONFIG_FOLDER, DEV_CONFIG_FILENAME);
+  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(appFolder, DEV_CONFIG_FOLDER));
+  await vscode.workspace.fs.writeFile(uri, contents);
+  output?.appendLine(
+    `  ${DEV_CONFIG_RELATIVE_PATH} not on the server — wrote a default (javaVersion: ${javaVersion})`,
+  );
+
+  const payload: NewDesignElementPayload = {
+    appid,
+    name: DEV_CONFIG_FILENAME,
+    designtype: DEV_CONFIG_DESIGN_TYPE,
+    contenttype: DEV_CONFIG_CONTENT_TYPE,
+    // Documentation stores its content in designsource, not designdata.
+    designdata: "",
+    designsource: contents.toString("base64"),
+    inheritfrom: null,
+    comment: "Tornado extension dev configuration",
+    options: "",
+    designparams: [],
+  };
+  try {
+    const created = await client.createDesignElement(appid, payload);
+    manifest.elements.push({
+      path: DEV_CONFIG_RELATIVE_PATH,
+      designbucketid: created.designbucketid,
+      name: created.name,
+      designtype: created.designtype,
+      contenttype: created.contenttype,
+      inheritfrom: created.inheritfrom,
+      comment: created.comment,
+      options: created.options,
+      designparams: created.designparams,
+    });
+    await writeManifestFile(appFolder, manifest);
+    output?.appendLine(`  pushed ${DEV_CONFIG_RELATIVE_PATH} to the server (id ${created.designbucketid})`);
+  } catch (error) {
+    logError(
+      output,
+      `  could not push ${DEV_CONFIG_RELATIVE_PATH} to the server: ${(error as Error).message} ` +
+        "(the local copy is still usable)",
+    );
+  }
 }
 
 export async function readDevConfig(appFolder: vscode.Uri): Promise<DevConfig | undefined> {
@@ -259,6 +351,9 @@ export async function readDevConfig(appFolder: vscode.Uri): Promise<DevConfig | 
 
 export interface DesignSyncResult {
   written: number;
+  // The manifest as just written — handed back so the caller can finish the
+  // sync (pushing a default devconfig.json) without re-reading it from disk.
+  manifest: Manifest;
 }
 
 export async function writeDesignElements(
@@ -290,9 +385,7 @@ export async function writeDesignElements(
 
     const nestedClass = isNestedJavaClassName(element.designtype, element.name);
     const folder = DESIGN_TYPE_FOLDERS[element.designtype] ?? `Type${element.designtype}`;
-    const fileName = nestedClass
-      ? `${element.name}.class`
-      : `${element.name}${extensionFor(element.designtype, element.contenttype)}`;
+    const fileName = fileNameFor(element.name, element.designtype, element.contenttype);
 
     if (!(element.designtype in DESIGN_TYPE_FOLDERS)) {
       // Not one of the known types — its folder wasn't pre-created above.
@@ -324,10 +417,11 @@ export async function writeDesignElements(
   // Persisted so the upload watcher can map a local file back to its
   // designbucketid without another round trip — the window (and any
   // in-memory state) is gone as soon as the workspace folder is opened.
-  await writeManifestFile(appFolder, { appid, connectionId, elements: manifestEntries });
+  const manifest: Manifest = { appid, connectionId, elements: manifestEntries };
+  await writeManifestFile(appFolder, manifest);
   output?.appendLine(`  wrote ${MANIFEST_FILENAME}`);
 
-  await ensureDevConfig(appFolder, output);
-
-  return { written: elements.length };
+  // devconfig.json is handled by the caller (ensureDevConfig), which has the
+  // client needed to push a default when the server doesn't have one yet.
+  return { written: elements.length, manifest };
 }

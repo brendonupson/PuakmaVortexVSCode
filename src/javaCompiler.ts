@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { TornadoClient } from "./tornadoClient";
 import { AGENT_INSTRUCTION_FILENAMES, DEV_CONFIG_RELATIVE_PATH, readDevConfig } from "./designSync";
+import { logError } from "./logging";
 
 const execFileAsync = promisify(execFile);
 
@@ -279,12 +280,14 @@ export async function compileApp(
       output.appendLine(stderr);
     }
   } catch (error) {
+    // ecj exited non-zero: whatever it printed is a compile diagnostic, so
+    // it's logged in red rather than mixed in with the ordinary progress.
     const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
     if (err.stdout?.trim()) {
-      output.appendLine(err.stdout);
+      logError(output, err.stdout);
     }
     if (err.stderr?.trim()) {
-      output.appendLine(err.stderr);
+      logError(output, err.stderr);
     }
     if (err.code === "ENOENT") {
       throw new Error(

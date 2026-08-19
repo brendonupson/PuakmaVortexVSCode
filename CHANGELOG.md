@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.6
+
+- The activity bar icon is now a proper vector head icon instead of the
+  placeholder funnel shape.
+- Java design elements (Actions/SharedCode/ScheduledActions) now get a
+  green or red "J" badge in the Explorer after each compile, based on
+  whether ecj reported an error for that specific source — no need to open
+  the Tornado output channel to see which file is broken.
+
 ## 0.0.5
 
 - Everything the extension logs is now mirrored to `console.log`, so it shows

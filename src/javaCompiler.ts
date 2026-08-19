@@ -194,6 +194,24 @@ export interface CompileResult {
   nestedClassFiles: vscode.Uri[]; // nested/inner/anonymous classes (e.g. Foo$Bar.class) — no source maps to these, so they're uploaded as SharedCode design elements instead, created on the server the first time each one is seen (see compileAndUploadFolder)
   hadErrors: boolean; // true if ecj reported errors — classFiles may still include stub classes for the affected sources (see compileApp)
   failedSourceNames: string[]; // base names (no extension) of sources that produced no class at all, even as a stub
+  sourceFiles: string[]; // every .java fsPath in this batch — paired with erroredSourceFiles to badge the Explorer (see JavaCompileStatusProvider)
+  erroredSourceFiles: string[]; // fsPaths (of sourceFiles) ecj reported an error against, including ones in failedSourceNames
+}
+
+// ecj's batch-compile diagnostics list each problem as
+// "<n>. ERROR in <path> (at line <n>)" (or WARNING) — parsed here to
+// attribute errors back to the specific source that has them, since
+// hadErrors above only says the batch as a whole had a problem somewhere.
+// This is ecj's plain-text output format, not a stable contract, but the
+// version is pinned above so it isn't going to shift under us.
+function parseErrorSourcePaths(output: string): Set<string> {
+  const paths = new Set<string>();
+  const regex = /^\d+\.\s+ERROR in (.+?)(?:\s*\(at line \d+\))?\s*$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(output))) {
+    paths.add(match[1].trim());
+  }
+  return paths;
 }
 
 export async function compileApp(
@@ -271,8 +289,10 @@ export async function compileApp(
 
   output.appendLine(`→ ${java} ${args.join(" ")}`);
   let hadErrors = false;
+  let combinedOutput = "";
   try {
     const { stdout, stderr } = await execFileAsync(java, args);
+    combinedOutput = `${stdout}\n${stderr}`;
     if (stdout.trim()) {
       output.appendLine(stdout);
     }
@@ -283,6 +303,7 @@ export async function compileApp(
     // ecj exited non-zero: whatever it printed is a compile diagnostic, so
     // it's logged in red rather than mixed in with the ordinary progress.
     const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+    combinedOutput = `${err.stdout ?? ""}\n${err.stderr ?? ""}`;
     if (err.stdout?.trim()) {
       logError(output, err.stdout);
     }
@@ -307,6 +328,7 @@ export async function compileApp(
         "affected source(s) may throw at runtime if the broken part is actually reached.",
     );
   }
+  const erroredSourceFiles = parseErrorSourcePaths(combinedOutput);
 
   const compiled = await vscode.workspace.fs.readDirectory(outDir);
   const classFiles: vscode.Uri[] = [];
@@ -335,6 +357,14 @@ export async function compileApp(
   const failedSourceNames = sourceFiles
     .map((file) => path.basename(file, ".java"))
     .filter((name) => !compiledNames.has(name));
+  // A source with no output at all is definitely broken even though ecj
+  // never got the chance to print an "ERROR in <path>" line for it (e.g. a
+  // file so malformed it can't be parsed at all).
+  for (const file of sourceFiles) {
+    if (failedSourceNames.includes(path.basename(file, ".java"))) {
+      erroredSourceFiles.add(file);
+    }
+  }
 
   output.appendLine(
     `Compiled ${classFiles.length} top-level class(es)` +
@@ -343,5 +373,12 @@ export async function compileApp(
         : "") +
       ".",
   );
-  return { classFiles, nestedClassFiles, hadErrors, failedSourceNames };
+  return {
+    classFiles,
+    nestedClassFiles,
+    hadErrors,
+    failedSourceNames,
+    sourceFiles,
+    erroredSourceFiles: [...erroredSourceFiles],
+  };
 }

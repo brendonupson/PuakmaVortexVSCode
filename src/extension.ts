@@ -40,6 +40,7 @@ import { openKeywordEditor } from "./keywordEditor";
 import { createOutputChannel, logError, traceCommand } from "./logging";
 import { compileApp, ensureServerLibraries } from "./javaCompiler";
 import { ensureJavaIntelliSense } from "./javaIntellisense";
+import { JavaCompileStatusProvider } from "./javaCompileStatus";
 
 async function buildClient(
   context: vscode.ExtensionContext,
@@ -185,6 +186,7 @@ async function compileAndUploadFolder(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   folder: vscode.Uri,
+  compileStatus: JavaCompileStatusProvider,
 ): Promise<CompileAndUploadSummary | undefined> {
   const manifest = await readManifest(folder);
   if (!manifest) {
@@ -195,6 +197,9 @@ async function compileAndUploadFolder(
   if (!result) {
     return undefined;
   }
+  // Badge every source in this batch green/red in the Explorer, regardless
+  // of whether its class made it onto the server below.
+  compileStatus.record(result.sourceFiles, new Set(result.erroredSourceFiles));
 
   let uploaded = 0;
   let skipped = 0;
@@ -322,6 +327,7 @@ async function confirmAndResetAppFolder(
   folder: vscode.Uri,
   output: vscode.OutputChannel,
   activeWatchers: Map<string, AppWatcher>,
+  compileStatus: JavaCompileStatusProvider,
 ): Promise<FolderResetChoice> {
   let entries: [string, vscode.FileType][];
   try {
@@ -392,6 +398,7 @@ async function confirmAndResetAppFolder(
   }
   await vscode.workspace.fs.createDirectory(folder);
   output.appendLine(`Deleted the local copy at ${folder.fsPath} before syncing a fresh one.`);
+  compileStatus.clearFolder(folder);
 
   if (devConfig) {
     const devConfigUri = vscode.Uri.joinPath(folder, DEV_CONFIG_RELATIVE_PATH);
@@ -881,6 +888,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
+  // Badges Actions/SharedCode/ScheduledActions .java files green/red in the
+  // Explorer based on their last compile — updated by compileAndUploadFolder
+  // after every manual or auto-compile-on-save run (see javaCompileStatus.ts).
+  const compileStatus = new JavaCompileStatusProvider();
+  context.subscriptions.push(compileStatus, vscode.window.registerFileDecorationProvider(compileStatus));
+
   const treeProvider = new InventoryTreeProvider(undefined, output);
   const treeView = vscode.window.createTreeView("tornadoInventory", {
     treeDataProvider: treeProvider,
@@ -1182,7 +1195,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // its delete handler can't mistake the wipe for the user removing
           // design elements. Restarted after the sync if it was running.
           const wasWatching = activeWatchers.has(folder.toString());
-          const reset = await confirmAndResetAppFolder(folder, output, activeWatchers);
+          const reset = await confirmAndResetAppFolder(folder, output, activeWatchers, compileStatus);
           if (reset === "cancel") {
             output.appendLine(`Sync of "${app.appname}" cancelled — the local copy was left alone.`);
             return;
@@ -1422,7 +1435,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       try {
-        const result = await compileAndUploadFolder(context, output, folder);
+        const result = await compileAndUploadFolder(context, output, folder, compileStatus);
         if (!result) {
           vscode.window.showInformationMessage("No .java sources found to compile.");
           return;
@@ -1946,7 +1959,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     compilingFolders.add(key);
     output.appendLine(`Auto-compiling ${folder.fsPath} after saving "${savedRelativePath}"...`);
     try {
-      const result = await compileAndUploadFolder(context, output, folder);
+      const result = await compileAndUploadFolder(context, output, folder, compileStatus);
       if (result) {
         output.appendLine(`Auto-compile: ${formatCompileSummary(result)}.`);
         // Only pop a toast for sources that produced no output at all —

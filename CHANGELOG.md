@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.7
+
+- Data connections are now synced to disk: opening/syncing an app writes each
+  of its data connections' schema dumps to `tornado/{app}/DataConnections/
+  {connectionname}.sql`, so the raw JDBC connection info is available locally
+  (e.g. for AI tooling) instead of only ever visible through the server's own
+  design endpoint.
+
 ## 0.0.6
 
 - The activity bar icon is now a proper vector head icon instead of the

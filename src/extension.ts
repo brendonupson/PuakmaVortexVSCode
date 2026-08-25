@@ -18,7 +18,12 @@ import {
   TornadoClient,
 } from "./tornadoClient";
 import { INHERITED_APP_URI_SCHEME, InventoryTreeProvider } from "./inventoryTreeProvider";
-import { assertSafePathSegment, ensureDesignElementFolder, folderName } from "./workspaceStorage";
+import {
+  assertSafePathSegment,
+  ensureDesignElementFolder,
+  folderName,
+  writeDataConnections,
+} from "./workspaceStorage";
 import {
   DesignSyncResult,
   DEV_CONFIG_RELATIVE_PATH,
@@ -124,9 +129,10 @@ async function syncDesignToFolder(
   const design = await client.fetchApplicationDesign(appid);
   const existingWatcher = activeWatchers.get(appFolder.toString());
   output.appendLine(`Writing ${design.designelements.length} design element(s) to disk...`);
-  // devconfig.json is settled inside the same suppressed block: writing (and
-  // possibly pushing) it is part of the sync, not a local edit for the
-  // watcher to echo back.
+
+  // devconfig.json and DataConnections/ are both settled inside the same
+  // suppressed block: writing them is part of the sync, not a local edit
+  // for the watcher to echo back as an upload.
   const writeAll = async (): Promise<DesignSyncResult> => {
     const written = await writeDesignElements(
       appFolder,
@@ -136,6 +142,16 @@ async function syncDesignToFolder(
       output,
     );
     await ensureDevConfig(appFolder, appid, client, written.manifest, output);
+
+    // Best-effort metadata for local AI tooling — a data connection only
+    // shows up once the app that owns it is opened, so this is the point to
+    // catch it. Never let a failure here (a bad connection name, a write
+    // error) look like the design sync itself failed.
+    try {
+      await writeDataConnections(appFolder, design.dataconnections);
+    } catch (error) {
+      logError(output, `Failed to write DataConnections metadata: ${(error as Error).message}`);
+    }
     return written;
   };
   const result = existingWatcher

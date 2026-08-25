@@ -117,6 +117,26 @@ export function extractKeywords(body: unknown): Keyword[] | undefined {
   return extractArray<Keyword>(body, (first) => "name" in first && "keyworddata" in first, /keyword/i);
 }
 
+// A named server-side JDBC data source (DATACONNECTION), carried alongside
+// a specific app's design pull (not the top-level /vortex inventory) purely
+// as reference metadata — Vortex2 never opens or queries it. "schema" is the
+// raw auto-generated DDL dump the server logs for it, including any
+// connection error it hit while generating it.
+export interface DataConnection {
+  connectionname: string;
+  databasename: string;
+  schema: string;
+  comment: string;
+}
+
+export function extractDataConnections(body: unknown): DataConnection[] | undefined {
+  return extractArray<DataConnection>(
+    body,
+    (first) => "connectionname" in first && "schema" in first,
+    /dataconnection/i,
+  );
+}
+
 // A single keyword from a create response: the wrapped {"keyword": {...}} the
 // PUT/POST bodies use, or the bare object. Exported for testability.
 export function unwrapKeyword(body: unknown): Keyword | undefined {
@@ -156,6 +176,10 @@ export interface ApplicationDesign {
   // no separate read endpoint for them. Empty when the response carries no
   // keyword array at all, which is not an error: an app can simply have none.
   keywords: Keyword[];
+  // Data connections ride along the same way — the full /vortex inventory
+  // does NOT carry them; they only show up once a specific app is opened.
+  // Empty when the response carries none, same reasoning as keywords.
+  dataconnections: DataConnection[];
 }
 
 // Same shape as a downloaded DesignElement, minus the server-managed audit
@@ -312,7 +336,19 @@ export class TornadoClient {
         `  no keyword array in the response for app ${appid} — top-level keys: ${Object.keys(body).join(", ")}`,
       );
     }
-    return { ...body, keywords: keywords ?? [] };
+
+    // Same reasoning as keywords: no dataconnections array at all just means
+    // this app has none, not an error.
+    const dataconnections = extractDataConnections(body);
+    if (dataconnections) {
+      this.output?.appendLine(`  ${dataconnections.length} data connection(s) for app ${appid}`);
+    } else {
+      this.output?.appendLine(
+        `  no dataconnections array in the response for app ${appid} — top-level keys: ${Object.keys(body).join(", ")}`,
+      );
+    }
+
+    return { ...body, keywords: keywords ?? [], dataconnections: dataconnections ?? [] };
   }
 
   // An application's APPPARAM key/value pairs, as their own collection

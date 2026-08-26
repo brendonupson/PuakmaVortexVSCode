@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.16
+
+- Fixed: an app synced before `java.project.sourcePaths` wiring existed (or
+  shipped in this build) could show its own SharedCode classes as
+  unresolved in the Java editor indefinitely — that wiring was previously
+  only run on sync/refresh. `Tornado: Compile & Upload Java` and
+  auto-compile-on-save now also configure it, so it self-heals on the next
+  compile instead of requiring an explicit re-sync.
+
 ## 0.0.15
 
 - Fixed: recompiling only re-uploaded a class if its compiled bytecode (or

@@ -706,11 +706,16 @@ are now implemented (with some deliberate gaps noted below). See the
   `java.project.referencedLibraries` setting, and adds that app's `Actions`,
   `SharedCode`, and `ScheduledActions` folders to `java.project.sourcePaths`
   (all merged in, not overwritten, and only once each — existing entries
-  are left alone). Requires the `redhat.java` extension to be installed; if
-  it isn't, this is skipped with a note in the "Tornado" output channel
-  rather than failing. The Java language server can need a reload or "Java:
-  Clean the Java Language Server Workspace" to pick up newly-added entries —
-  the extension prompts for that the first time it adds one.
+  are left alone). `Tornado: Compile & Upload Java` and auto-compile-on-save
+  also run this same step (`compileAndUploadFolder()`) — not just
+  sync/refresh — so an app synced before this wiring existed (or before it
+  needed more source folders than it had at the time) still gets configured
+  the next time it's compiled, rather than needing an explicit re-sync.
+  Requires the `redhat.java` extension to be installed; if it isn't, this is
+  skipped with a note in the "Tornado" output channel rather than failing.
+  The Java language server can need a reload or "Java: Clean the Java
+  Language Server Workspace" to pick up newly-added entries — the extension
+  prompts for that the first time it adds one.
 
 Open decision: whether `tornado/` should be git-ignored (a local sync
 cache) or committed (the source of truth) — not yet resolved.

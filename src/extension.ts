@@ -276,6 +276,26 @@ async function compileAndUploadFolder(
     throw new Error(`No manifest found in ${folder.fsPath}.`);
   }
   const { client } = await buildClientForConnection(context, output, manifest.connectionId);
+
+  // ensureJavaIntelliSense is otherwise only called on sync/refresh — an app
+  // synced before that wiring existed (or before this app's own SharedCode
+  // grew enough to need it) would otherwise never get java.project.sourcePaths
+  // until the user happens to re-sync it, leaving IntelliSense unable to
+  // resolve the app's own classes across files indefinitely. Cheap to call
+  // here too: a no-op once already configured, non-fatal if it fails.
+  try {
+    const justConfigured = await ensureJavaIntelliSense(output, folder);
+    if (justConfigured) {
+      vscode.window.showInformationMessage(
+        "Tornado: pointed the Java editor at the server's jars and source folders for IntelliSense. If " +
+          "types or fields still show as unresolved, run 'Java: Clean the Java Language Server Workspace' " +
+          "or reload the window.",
+      );
+    }
+  } catch (error) {
+    logError(output, `Could not configure Java IntelliSense: ${(error as Error).message}`);
+  }
+
   const result = await compileApp(folder, manifest.connectionId, client, context.globalStorageUri, output);
   if (!result) {
     return undefined;

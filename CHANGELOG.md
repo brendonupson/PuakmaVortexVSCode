@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.11
+
+- Fixed: `.jar` files synced as SharedCode design elements were silently
+  excluded from the Java compile classpath, so any app-specific jar (as
+  opposed to a server-wide shared library) failed to resolve at compile
+  time. `Compile & Upload Java` now includes them.
+- Fixed: right after a fresh sync, an Action's Java source could fail to
+  resolve a static field (or other symbol) in a SharedCode class, because
+  the Java language server had no explicit project shape for an app's
+  loose `Actions`/`SharedCode`/`ScheduledActions` folders and had to guess
+  via its own "invisible project" heuristics — unreliable when several
+  apps sit as sibling folders under one workspace. Every sync/refresh now
+  also declares those folders via `java.project.sourcePaths`, alongside
+  the existing `java.project.referencedLibraries` jar wiring.
+
 ## 0.0.10
 
 - "Tornado: Refresh from Server" now forces a fresh pull of the server's

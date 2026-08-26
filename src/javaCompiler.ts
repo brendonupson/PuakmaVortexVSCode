@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 // compiled together in one invocation rather than per-file — matches how
 // the reference tool (vortex-cli-mirror's compile.py) does it, for the
 // same reason.
-const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"];
+export const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"];
 
 // A single -d flag needs one shared output root regardless of which of the
 // three folders a source came from — so compiled classes land here, not
@@ -246,8 +246,11 @@ export async function compileApp(
   // lives, alongside (not inside) any particular app's folder.
   const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
   const serverClasspath = await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
+  // Jar-type design elements always sync into SharedCode (see designSync.ts's
+  // useSourceField), so that's the only app folder worth scanning for them.
+  const sharedCodeJars = await findJarsRecursive(vscode.Uri.joinPath(appFolder, "SharedCode"));
   const extraClasspath = vscode.workspace.getConfiguration("tornado").get<string[]>("compileClasspath", []);
-  const classpath = [...serverClasspath, ...extraClasspath];
+  const classpath = [...serverClasspath, ...sharedCodeJars, ...extraClasspath];
 
   const outDir = vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER);
   // Cleared before every run rather than just created-if-missing: javac

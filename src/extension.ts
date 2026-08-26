@@ -171,11 +171,11 @@ async function syncDesignToFolder(
   try {
     const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
     await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output, forceLibraryRefresh);
-    const justConfigured = await ensureJavaIntelliSense(output);
+    const justConfigured = await ensureJavaIntelliSense(output, appFolder);
     if (justConfigured) {
       vscode.window.showInformationMessage(
-        "Tornado: pointed the Java editor at the server's jars for IntelliSense. If types like " +
-          "ActionRunner still show as unresolved, run 'Java: Clean the Java Language Server Workspace' " +
+        "Tornado: pointed the Java editor at the server's jars and source folders for IntelliSense. If " +
+          "types or fields still show as unresolved, run 'Java: Clean the Java Language Server Workspace' " +
           "or reload the window.",
       );
     }
@@ -1521,7 +1521,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
         const tornadoRoot = vscode.Uri.joinPath(folder, "..");
         await ensureServerLibraries(tornadoRoot, folder, manifest.connectionId, client, output, true);
-        await ensureJavaIntelliSense(output);
+        await ensureJavaIntelliSense(output, folder);
         vscode.window.showInformationMessage(`Refreshed server libraries for "${connectionName}".`);
       } catch (error) {
         logError(output, `Refreshing server libraries failed: ${(error as Error).message}`);

@@ -646,16 +646,19 @@ are now implemented (with some deliberate gaps noted below). See the
   javac compile classpath above — Actions/SharedCode/ScheduledActions are
   loose files with no Maven/Gradle/Eclipse project behind them, so without
   this, VS Code's Java language server (the `redhat.java` extension) has no
-  classpath for them and shows framework types like `ActionRunner` as
-  "cannot be resolved to a type" even though compilation works fine. Every
-  sync/refresh that downloads server jars also adds
-  `tornado/.lib/**/*.jar` to the workspace's `java.project.referencedLibraries`
-  setting (merged in, not overwritten, and only once — existing entries are
-  left alone). Requires the `redhat.java` extension to be installed; if it
-  isn't, this is skipped with a note in the "Tornado" output channel rather
-  than failing. The Java language server can need a reload or "Java: Clean
-  the Java Language Server Workspace" to pick up a newly-added classpath
-  entry — the extension prompts for that the first time it adds one.
+  classpath or project shape for them: framework types like `ActionRunner`
+  show as "cannot be resolved to a type", and a static field in one
+  `SharedCode` class can fail to resolve from an `Actions` class, even
+  though compilation works fine either way. Every sync/refresh that
+  downloads server jars also adds `tornado/.lib/**/*.jar` to the workspace's
+  `java.project.referencedLibraries` setting, and adds that app's `Actions`,
+  `SharedCode`, and `ScheduledActions` folders to `java.project.sourcePaths`
+  (both merged in, not overwritten, and only once each — existing entries
+  are left alone). Requires the `redhat.java` extension to be installed; if
+  it isn't, this is skipped with a note in the "Tornado" output channel
+  rather than failing. The Java language server can need a reload or "Java:
+  Clean the Java Language Server Workspace" to pick up newly-added entries —
+  the extension prompts for that the first time it adds one.
 
 Open decision: whether `tornado/` should be git-ignored (a local sync
 cache) or committed (the source of truth) — not yet resolved.

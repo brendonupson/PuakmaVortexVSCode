@@ -96,7 +96,7 @@ async function findJarsRecursive(dir: vscode.Uri): Promise<string[]> {
 // contenttype field is the only reliable signal, so it's consulted first;
 // the plain .jar filesystem scan stays as a fallback for jars not (yet)
 // reflected there — a pre-manifest sync, or one manually dropped in.
-async function findSharedCodeJars(appFolder: vscode.Uri): Promise<string[]> {
+export async function findSharedCodeJars(appFolder: vscode.Uri): Promise<string[]> {
   const manifest = await readManifest(appFolder);
   const jarPaths = new Set(
     (manifest?.elements ?? [])

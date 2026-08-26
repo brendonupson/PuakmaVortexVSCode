@@ -1,34 +1,40 @@
 import * as vscode from "vscode";
-import { JAVA_SOURCE_FOLDERS } from "./javaCompiler";
+import { JAVA_SOURCE_FOLDERS, findSharedCodeJars } from "./javaCompiler";
 
 const REFERENCED_LIBRARIES_KEY = "project.referencedLibraries";
 const SOURCE_PATHS_KEY = "project.sourcePaths";
 const LIB_GLOB = "tornado/.lib/**/*.jar";
+// The sync root was ".tornado/" (hidden) before it was renamed to visible
+// "tornado/" pre-0.0.1 (see cb310f5) — this old glob never matches anything
+// post-rename, but the merge-only-add logic below never removed it from
+// workspaces that picked it up before the rename, so it's pruned on sight.
+const OBSOLETE_LIB_GLOB = ".tornado/.lib/**/*.jar";
 const JAVA_EXTENSION_ID = "redhat.java";
 
 type ReferencedLibraries =
   | string[]
   | { include?: string[]; exclude?: string[]; sources?: Record<string, string> };
 
-function addReferencedLibraries(config: vscode.WorkspaceConfiguration): boolean {
+// Merges `entries` into java.project.referencedLibraries (skipping ones
+// already present) and drops any of `stale` found there. Returns true if
+// the setting was actually changed.
+function updateReferencedLibraries(
+  config: vscode.WorkspaceConfiguration,
+  entries: string[],
+  stale: string[],
+): boolean {
   const current = config.inspect<ReferencedLibraries>(REFERENCED_LIBRARIES_KEY)?.workspaceValue;
+  const currentList = Array.isArray(current) ? current : (current?.include ?? []);
 
-  let updated: ReferencedLibraries;
-  if (Array.isArray(current)) {
-    if (current.includes(LIB_GLOB)) {
-      return false;
-    }
-    updated = [...current, LIB_GLOB];
-  } else if (current && typeof current === "object") {
-    const include = current.include ?? [];
-    if (include.includes(LIB_GLOB)) {
-      return false;
-    }
-    updated = { ...current, include: [...include, LIB_GLOB] };
-  } else {
-    updated = [LIB_GLOB];
+  const pruned = currentList.filter((e) => !stale.includes(e));
+  const missing = entries.filter((e) => !pruned.includes(e));
+  if (missing.length === 0 && pruned.length === currentList.length) {
+    return false;
   }
+  const merged = [...pruned, ...missing];
 
+  const updated: ReferencedLibraries =
+    current && !Array.isArray(current) ? { ...current, include: merged } : merged;
   void config.update(REFERENCED_LIBRARIES_KEY, updated, vscode.ConfigurationTarget.Workspace);
   return true;
 }
@@ -80,9 +86,18 @@ export async function ensureJavaIntelliSense(
   }
 
   const config = vscode.workspace.getConfiguration("java");
-  const librariesChanged = addReferencedLibraries(config);
+  // The glob only ever reaches tornado/.lib/ — a jar dropped directly in an
+  // app's own SharedCode/ (see findSharedCodeJars in javaCompiler.ts, which
+  // also feeds the actual compile classpath) needs its own explicit entry,
+  // since it lives outside that glob's reach.
+  const sharedCodeJars = await findSharedCodeJars(appFolder);
+  const librariesChanged = updateReferencedLibraries(config, [LIB_GLOB, ...sharedCodeJars], [OBSOLETE_LIB_GLOB]);
   if (librariesChanged) {
-    output.appendLine(`Added "${LIB_GLOB}" to java.project.referencedLibraries (workspace settings).`);
+    output.appendLine(
+      "Updated java.project.referencedLibraries (workspace settings) with the server jar glob" +
+        (sharedCodeJars.length > 0 ? ` and ${sharedCodeJars.length} SharedCode jar(s)` : "") +
+        ".",
+    );
   }
   const sourcePathsChanged = addSourcePaths(config, appFolder);
   if (sourcePathsChanged) {

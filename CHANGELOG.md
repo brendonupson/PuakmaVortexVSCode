@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.13
+
+- Fixed: the Java editor (IntelliSense) still couldn't resolve types from a
+  jar synced directly into an app's `SharedCode/` — `java.project.
+  referencedLibraries` only ever pointed the `redhat.java` language server
+  at `tornado/.lib/**/*.jar` (the connection-wide cache), the same gap
+  0.0.12 fixed for the actual compile classpath. Every sync/refresh now
+  also adds an explicit entry for each of that app's SharedCode jars
+  (found the same contenttype-aware way as the compile classpath).
+- Also cleans up an old `.tornado/.lib/**/*.jar` entry some workspaces
+  picked up before the sync folder was renamed from the hidden `.tornado/`
+  to `tornado/`, pre-0.0.1 — it never matched anything after the rename,
+  but nothing removed it until now.
+
 ## 0.0.12
 
 - Fixed: a SharedCode jar (`application/java-archive`) wasn't always picked

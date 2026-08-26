@@ -650,10 +650,12 @@ are now implemented (with some deliberate gaps noted below). See the
   show as "cannot be resolved to a type", and a static field in one
   `SharedCode` class can fail to resolve from an `Actions` class, even
   though compilation works fine either way. Every sync/refresh that
-  downloads server jars also adds `tornado/.lib/**/*.jar` to the workspace's
+  downloads server jars also adds `tornado/.lib/**/*.jar` — plus an explicit
+  entry for each jar found directly under that app's own `SharedCode/`,
+  which the glob doesn't reach — to the workspace's
   `java.project.referencedLibraries` setting, and adds that app's `Actions`,
   `SharedCode`, and `ScheduledActions` folders to `java.project.sourcePaths`
-  (both merged in, not overwritten, and only once each — existing entries
+  (all merged in, not overwritten, and only once each — existing entries
   are left alone). Requires the `redhat.java` extension to be installed; if
   it isn't, this is skipped with a note in the "Tornado" output channel
   rather than failing. The Java language server can need a reload or "Java:

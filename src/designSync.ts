@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { DesignElement, DesignParam, NewDesignElementPayload, TornadoClient } from "./tornadoClient";
+import { AppParam, DesignElement, DesignParam, NewDesignElementPayload, TornadoClient } from "./tornadoClient";
 import { assertSafePathSegment } from "./workspaceStorage";
 import { logError } from "./logging";
 
@@ -221,6 +221,12 @@ export interface ManifestEntry {
 export interface Manifest {
   appid: number;
   connectionId: string;
+  // AppParam[] once this app has been synced/refreshed under the manifest
+  // parameter-push feature; undefined if it never has been (an older
+  // manifest) or the server didn't return a recognisable appparams array.
+  // See ApplicationDesign.appparams (tornadoClient.ts) for why this is
+  // never defaulted to [] — diffManifestParams() below depends on that.
+  appparams: AppParam[] | undefined;
   elements: ManifestEntry[];
 }
 
@@ -361,6 +367,7 @@ export async function writeDesignElements(
   appid: number,
   connectionId: string,
   elements: DesignElement[],
+  appparams: AppParam[] | undefined,
   output?: vscode.OutputChannel,
 ): Promise<DesignSyncResult> {
   const manifestEntries: ManifestEntry[] = [];
@@ -417,11 +424,120 @@ export async function writeDesignElements(
   // Persisted so the upload watcher can map a local file back to its
   // designbucketid without another round trip — the window (and any
   // in-memory state) is gone as soon as the workspace folder is opened.
-  const manifest: Manifest = { appid, connectionId, elements: manifestEntries };
+  const manifest: Manifest = { appid, connectionId, appparams, elements: manifestEntries };
   await writeManifestFile(appFolder, manifest);
   output?.appendLine(`  wrote ${MANIFEST_FILENAME}`);
 
   // devconfig.json is handled by the caller (ensureDevConfig), which has the
   // client needed to push a default when the server doesn't have one yet.
   return { written: elements.length, manifest };
+}
+
+type NamedParam = { paramname: string; paramvalue: string };
+
+// Unordered equality by paramname — a file that was merely reformatted or
+// reordered (e.g. by an editor's auto-format) must not look like a parameter
+// change. Exported for testability.
+export function paramsEqual(a: NamedParam[], b: NamedParam[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const toMap = (params: NamedParam[]) => new Map(params.map((p) => [p.paramname, p.paramvalue]));
+  const mapA = toMap(a);
+  const mapB = toMap(b);
+  if (mapA.size !== mapB.size) {
+    return false; // a duplicate paramname on one side collapsed differently
+  }
+  for (const [name, value] of mapA) {
+    if (mapB.get(name) !== value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export interface ManifestParamDiff {
+  appParams?: AppParam[];
+  changedEntries: { entry: ManifestEntry; designparams: DesignParam[] }[];
+}
+
+// Compares two snapshots of the same .tornado-manifest.json and reports only
+// the designparams/appparams changes worth pushing to the server — the only
+// two fields this file lets an external edit (e.g. by an AI coding agent)
+// change. Everything else about an entry (name/comment/options/inheritfrom/
+// contenttype/designtype/designbucketid) and any added/removed entry is
+// intentionally left alone: it rides along verbatim the next time that
+// file's content is saved normally, same as any pre-existing manifest field
+// always has.
+//
+// Returns undefined — refuse to push or adopt anything — if `next.appid`
+// doesn't match `expectedAppid`, the caller's own fixed identity for this
+// app (e.g. AppWatcher's `appid` field). Comparing against `previous.appid`
+// instead would trust a manifest that could already have been wrong before
+// this edit.
+export function diffManifestParams(
+  expectedAppid: number,
+  previous: Manifest,
+  next: Manifest,
+  output?: vscode.OutputChannel,
+): ManifestParamDiff | undefined {
+  if (next.appid !== expectedAppid) {
+    logError(
+      output,
+      `  ${MANIFEST_FILENAME}: "appid" changed to ${next.appid} (expected ${expectedAppid}) — ` +
+        "ignoring this edit entirely and not adopting it, to avoid pushing to the wrong application.",
+    );
+    return undefined;
+  }
+
+  const diff: ManifestParamDiff = { changedEntries: [] };
+
+  // See the comment on Manifest.appparams: undefined means "no trustworthy
+  // baseline," which must never be treated as "empty" — that would turn the
+  // next unrelated appparams edit into a full-replace wipe of every real
+  // parameter on the server.
+  if (previous.appparams === undefined) {
+    if (next.appparams !== undefined) {
+      output?.appendLine(
+        `  ${MANIFEST_FILENAME}: "appparams" has no baseline (this app hasn't been synced or refreshed ` +
+          'since this feature shipped) — not pushing. Run "Tornado: Refresh from Server" once, then edit ' +
+          "appparams again.",
+      );
+    }
+  } else if (next.appparams === undefined) {
+    output?.appendLine(
+      `  ${MANIFEST_FILENAME}: "appparams" key was removed — not pushing (that would delete every ` +
+        'application parameter on the server). Restore it or run "Tornado: Refresh from Server" to reset the baseline.',
+    );
+  } else if (!paramsEqual(previous.appparams, next.appparams)) {
+    diff.appParams = next.appparams;
+  }
+
+  const prevByPath = new Map(previous.elements.map((e) => [e.path, e]));
+  const nextByPath = new Map(next.elements.map((e) => [e.path, e]));
+
+  for (const [path, nextEntry] of nextByPath) {
+    const prevEntry = prevByPath.get(path);
+    if (!prevEntry) {
+      output?.appendLine(`  ${MANIFEST_FILENAME}: "${path}" is new — not created on the server by this feature.`);
+      continue;
+    }
+    if (!paramsEqual(prevEntry.designparams, nextEntry.designparams)) {
+      if (supportsDesignParams(nextEntry.designtype)) {
+        diff.changedEntries.push({ entry: nextEntry, designparams: nextEntry.designparams });
+      } else {
+        output?.appendLine(
+          `  ${MANIFEST_FILENAME}: "${path}" designparams changed but design type ${nextEntry.designtype} ` +
+            "has none — ignored.",
+        );
+      }
+    }
+  }
+  for (const path of prevByPath.keys()) {
+    if (!nextByPath.has(path)) {
+      output?.appendLine(`  ${MANIFEST_FILENAME}: "${path}" was removed — not deleted on the server by this feature.`);
+    }
+  }
+
+  return diff;
 }

@@ -373,6 +373,41 @@ are now implemented (with some deliberate gaps noted below). See the
   `tornadoClient.ts`): it takes that wrapped form, an object wrapping the
   array under any other key, or a bare array.
 
+- **Editing parameters by hand** (e.g. from an AI coding agent like Claude
+  Code): while an app is being watched, a direct edit to
+  `.tornado-manifest.json` on disk — not through either editor above — is
+  also picked up and pushed to the server, via `AppWatcher.handleManifestChange()`
+  in `appWatcher.ts`. This is the process for a tool that edits files
+  directly rather than driving the extension's own UI.
+
+  - **Only two fields are synced this way**: an entry's `designparams`
+    (matched to its design element by `path`) and the top-level `appparams`.
+    Any other edit — renaming an entry's `name`/`comment`/`options`, adding
+    or removing an entry, changing `appid`/`connectionId` — is logged to the
+    output channel and otherwise ignored; it isn't pushed, and isn't
+    reverted either, so it rides along unchanged the next time that entry's
+    content file is next saved normally (true of any manifest field, not
+    new here).
+  - **Full-replace semantics apply here too**: a param omitted from the
+    edited array is deleted server-side, the same as dropping one in the
+    interactive editors above.
+  - **`appparams` needs a baseline first.** A manifest written before an app
+    has been synced or refreshed at least once under this feature has no
+    `appparams` to compare against, so an edit to it is skipped (and logged)
+    rather than risking a partial write that looks like "delete everything
+    except what I just typed." Run `Tornado: Refresh from Server` once if an
+    `appparams` edit doesn't seem to be taking effect. `designparams` has no
+    such caveat — it's always populated by the ordinary design pull.
+  - Comparison is by parameter name, not array position, so reformatting or
+    reordering the JSON (e.g. an editor auto-formatting on save) never looks
+    like a change.
+  - Like every other local-edit-to-upload path in this extension, this only
+    works while the app's watcher is running (`Tornado: Start Watching`) —
+    an edit made while nothing is watching that folder sits locally until
+    the next manual sync.
+  - Set `tornado.pushLocalParameterEdits` to `false` to hand-edit the
+    manifest offline without triggering a live push.
+
 - **Editing keywords** (`KEYWORD` / `KEYWORDDATA`, `keywordEditor.ts`):
   `Tornado: Edit Keywords`, from the Command Palette or by right-clicking a
   synced app's folder in the Explorer, opens **the extension's only webview** —

@@ -139,6 +139,7 @@ async function syncDesignToFolder(
       appid,
       connectionId,
       design.designelements,
+      design.appparams,
       output,
     );
     await ensureDevConfig(appFolder, appid, client, written.manifest, output);
@@ -1154,6 +1155,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
+    registerTracedCommand("tornado.expandAllAppGroups", async () => {
+      await treeProvider.expandAll();
+    }),
+  );
+
+  context.subscriptions.push(
+    registerTracedCommand("tornado.collapseAllAppGroups", () => {
+      treeProvider.collapseAll();
+    }),
+  );
+
+  context.subscriptions.push(
     registerTracedCommand(
       "tornado.syncApplication",
       async (selected?: InventoryItem) => {
@@ -1875,9 +1888,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // designparams with every file upload (see appWatcher.ts), so
           // leaving a stale copy here would silently revert what was just
           // saved the next time the file is edited.
-          entry.designparams = newParams;
-          await writeManifestFile(appFolder, manifest);
-          await activeWatchers.get(appFolder.toString())?.reloadManifest();
+          //
+          // Re-read fresh from disk rather than reusing `manifest` as read at
+          // command start: the QuickPick can stay open arbitrarily long, and
+          // if a local edit to .tornado-manifest.json (e.g. by an external
+          // tool) landed while it was open, writing back this command's
+          // stale full copy would silently revert it. Wrapped in
+          // runSuppressed so the watcher doesn't mistake this write for a
+          // local edit needing its own push.
+          const watcher = activeWatchers.get(appFolder.toString());
+          const applyAndWrite = async (): Promise<void> => {
+            const fresh = (await readManifest(appFolder)) ?? manifest;
+            const freshEntry = fresh.elements.find((e) => e.path === entry.path);
+            if (freshEntry) {
+              freshEntry.designparams = newParams;
+            }
+            await writeManifestFile(appFolder, fresh);
+            await watcher?.reloadManifest();
+          };
+          if (watcher) {
+            await watcher.runSuppressed(applyAndWrite);
+          } else {
+            await applyAndWrite();
+          }
 
           for (const change of changes) {
             output.appendLine(`  ${change}`);
@@ -1933,6 +1966,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
           await client.updateApplicationParams(manifest.appid, newParams);
+
+          // Keep the manifest's appparams live, the same way
+          // editDesignElementParameters does for a design element's
+          // designparams — otherwise it goes stale relative to the server
+          // immediately after this edit. Re-read fresh from disk (not the
+          // `manifest` read at command start) and wrap in runSuppressed for
+          // the same reasons as above.
+          const watcher = activeWatchers.get(folder.toString());
+          const applyAndWrite = async (): Promise<void> => {
+            const fresh = (await readManifest(folder)) ?? manifest;
+            fresh.appparams = newParams;
+            await writeManifestFile(folder, fresh);
+            await watcher?.reloadManifest();
+          };
+          if (watcher) {
+            await watcher.runSuppressed(applyAndWrite);
+          } else {
+            await applyAndWrite();
+          }
 
           for (const change of changes) {
             output.appendLine(`  ${change}`);

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.8
+
+- Editing `.tornado-manifest.json` directly on disk — e.g. by an AI coding
+  agent like Claude Code, rather than through this extension's own UI — now
+  pushes the resulting `designparams`/`appparams` changes to the Tornado
+  server, the same way the interactive "Edit Parameters" commands do,
+  whenever the app's watcher is running. See the README for the full
+  contract (which fields are watched, full-replace semantics, and the new
+  `tornado.pushLocalParameterEdits` setting to disable it).
+- The Inventory view now starts collapsed, and its title bar gained "Expand
+  All" and "Collapse All" buttons for its app groups.
+
 ## 0.0.7
 
 - Data connections are now synced to disk: opening/syncing an app writes each

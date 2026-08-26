@@ -10,9 +10,11 @@ import {
   Manifest,
   ManifestEntry,
   MANIFEST_FILENAME,
+  diffManifestParams,
   folderToDesignType,
   inferContentType,
   isJavaSourceUpload,
+  readManifest,
   serverNameFor,
   useSourceField,
   writeManifestFile,
@@ -173,12 +175,11 @@ export class AppWatcher implements vscode.Disposable {
 
   private async handleChange(uri: vscode.Uri): Promise<void> {
     const relativePath = this.toRelativePath(uri);
-    if (
-      !relativePath ||
-      relativePath === MANIFEST_FILENAME ||
-      AGENT_INSTRUCTION_FILENAMES.includes(relativePath)
-    ) {
+    if (!relativePath || AGENT_INSTRUCTION_FILENAMES.includes(relativePath)) {
       return;
+    }
+    if (relativePath === MANIFEST_FILENAME) {
+      return this.handleManifestChange();
     }
 
     const entry = this.findEntry(relativePath);
@@ -219,6 +220,69 @@ export class AppWatcher implements vscode.Disposable {
       this.output.appendLine(`Uploaded "${relativePath}".`);
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to upload "${relativePath}": ${(error as Error).message}`);
+    }
+  }
+
+  // Lets an external edit to .tornado-manifest.json (e.g. by an AI coding
+  // agent working directly on disk, bypassing this extension's own edit
+  // commands) push a designparams/appparams change to the server — the same
+  // two fields, and the same TornadoClient calls, the interactive parameter
+  // editors already use. Every other field/structural change in the
+  // manifest is deliberately not synced here; see diffManifestParams().
+  //
+  // The two other unsuppressed manifest writes in this class
+  // (handleCreate/handleDelete, via persistManifest()) are safe without any
+  // special-casing here: both mutate `this.manifest` in memory *before*
+  // writing it, so by the time the async fs event this method responds to
+  // is actually processed, `this.manifest` already matches what's on disk —
+  // the diff below comes out empty and this is a no-op.
+  private async handleManifestChange(): Promise<void> {
+    if (!vscode.workspace.getConfiguration("tornado").get<boolean>("pushLocalParameterEdits", true)) {
+      return;
+    }
+
+    const onDisk = await readManifest(this.appFolder);
+    if (!onDisk || !Array.isArray(onDisk.elements) || typeof onDisk.appid !== "number") {
+      this.output.appendLine(
+        `${MANIFEST_FILENAME} could not be parsed or is missing required fields — ignoring this change, ` +
+          "keeping the last known-good manifest in memory.",
+      );
+      return;
+    }
+
+    const diff = diffManifestParams(this.appid, this.manifest, onDisk, this.output);
+    if (!diff) {
+      // Identity check failed — diffManifestParams already logged why. Do
+      // NOT adopt onDisk: this.manifest stays the last trustworthy state.
+      return;
+    }
+    // Adopt only once the identity check passed — mirrors reloadManifest()'s
+    // unconditional-adopt semantics for the normal case. This method never
+    // calls writeManifestFile, so adopting here cannot itself trigger
+    // another change event.
+    this.manifest = onDisk;
+
+    if (diff.appParams) {
+      try {
+        await this.client.updateApplicationParams(this.appid, diff.appParams);
+        this.output.appendLine(`Pushed application parameters from ${MANIFEST_FILENAME}.`);
+      } catch (error) {
+        logError(
+          this.output,
+          `Failed to push application parameters from ${MANIFEST_FILENAME}: ${(error as Error).message}`,
+        );
+      }
+    }
+    for (const { entry, designparams } of diff.changedEntries) {
+      try {
+        await this.client.updateDesignParams(this.appid, entry.designbucketid, designparams);
+        this.output.appendLine(`Pushed design parameters for "${entry.path}" from ${MANIFEST_FILENAME}.`);
+      } catch (error) {
+        logError(
+          this.output,
+          `Failed to push design parameters for "${entry.path}" from ${MANIFEST_FILENAME}: ${(error as Error).message}`,
+        );
+      }
     }
   }
 

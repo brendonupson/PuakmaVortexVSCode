@@ -180,6 +180,16 @@ export interface ApplicationDesign {
   // does NOT carry them; they only show up once a specific app is opened.
   // Empty when the response carries none, same reasoning as keywords.
   dataconnections: DataConnection[];
+  // Application parameters ride along the same way too, BUT — unlike
+  // keywords/dataconnections above — this is deliberately left `undefined`
+  // rather than defaulted to `[]` when the response doesn't carry a
+  // recognisable "appparams" array. This value becomes a full-replace PUT
+  // baseline in designSync.ts's diffManifestParams(): treating "we don't
+  // actually know what the server has" the same as "the app genuinely has
+  // none" would let a single local parameter edit silently wipe every real
+  // application parameter on the server. Do not "fix" this to match the
+  // keywords/dataconnections style above.
+  appparams: AppParam[] | undefined;
 }
 
 // Same shape as a downloaded DesignElement, minus the server-managed audit
@@ -348,7 +358,18 @@ export class TornadoClient {
       );
     }
 
-    return { ...body, keywords: keywords ?? [], dataconnections: dataconnections ?? [] };
+    // Unlike keywords/dataconnections, appparams is NOT defaulted to [] on a
+    // miss — see the comment on ApplicationDesign.appparams for why.
+    const appparams = extractParams<AppParam>(body);
+    if (appparams) {
+      this.output?.appendLine(`  ${appparams.length} application parameter(s) for app ${appid}`);
+    } else {
+      this.output?.appendLine(
+        `  no appparams array in the response for app ${appid} — top-level keys: ${Object.keys(body).join(", ")}`,
+      );
+    }
+
+    return { ...body, keywords: keywords ?? [], dataconnections: dataconnections ?? [], appparams };
   }
 
   // An application's APPPARAM key/value pairs, as their own collection

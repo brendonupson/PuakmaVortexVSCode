@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -44,6 +44,16 @@
         "command": "tornado.refreshInventory",
         "title": "Tornado: Refresh Inventory",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "tornado.expandAllAppGroups",
+        "title": "Tornado: Expand All App Groups",
+        "icon": "$(expand-all)"
+      },
+      {
+        "command": "tornado.collapseAllAppGroups",
+        "title": "Tornado: Collapse All App Groups",
+        "icon": "$(collapse-all)"
       },
       {
         "command": "tornado.syncApplication",
@@ -142,6 +152,11 @@
           "type": "boolean",
           "default": true,
           "description": "When a watched application's .java file (Actions/SharedCode/ScheduledActions) is saved, automatically compile the whole application's Java and upload the resulting classes. Disable if this feels too eager (e.g. compiling on every save while iterating)."
+        },
+        "tornado.pushLocalParameterEdits": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a watched application's .tornado-manifest.json is edited directly on disk (e.g. by an external tool or an AI coding agent), push the resulting designparams/appparams changes to the Tornado server the same way the interactive parameter-editing commands do. Disable to hand-edit the manifest offline without triggering a live push."
         }
       }
     },
@@ -209,29 +224,39 @@
           "group": "navigation@1"
         },
         {
-          "command": "tornado.selectConnection",
+          "command": "tornado.expandAllAppGroups",
           "when": "view == tornadoInventory",
           "group": "navigation@2"
         },
         {
-          "command": "tornado.addConnection",
+          "command": "tornado.collapseAllAppGroups",
           "when": "view == tornadoInventory",
           "group": "navigation@3"
         },
         {
-          "command": "tornado.createApplication",
-          "when": "view == tornadoInventory && tornado.hasActiveConnection",
-          "group": "navigation@4"
-        },
-        {
-          "command": "tornado.editConnection",
+          "command": "tornado.selectConnection",
           "when": "view == tornadoInventory",
           "group": "1_connections@1"
         },
         {
-          "command": "tornado.deleteConnection",
+          "command": "tornado.addConnection",
           "when": "view == tornadoInventory",
           "group": "1_connections@2"
+        },
+        {
+          "command": "tornado.editConnection",
+          "when": "view == tornadoInventory",
+          "group": "1_connections@3"
+        },
+        {
+          "command": "tornado.deleteConnection",
+          "when": "view == tornadoInventory",
+          "group": "1_connections@4"
+        },
+        {
+          "command": "tornado.createApplication",
+          "when": "view == tornadoInventory && tornado.hasActiveConnection",
+          "group": "2_application@1"
         },
         {
           "command": "tornado.refreshFromServer",

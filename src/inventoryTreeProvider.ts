@@ -20,13 +20,16 @@ class AppGroupTreeItem extends vscode.TreeItem {
     groupName: string,
     public readonly items: InventoryItem[],
   ) {
-    super(groupName, vscode.TreeItemCollapsibleState.Expanded);
+    super(groupName, vscode.TreeItemCollapsibleState.Collapsed);
     this.iconPath = new vscode.ThemeIcon("folder");
   }
 }
 
 class InventoryTreeItem extends vscode.TreeItem {
-  constructor(public readonly item: InventoryItem) {
+  constructor(
+    public readonly item: InventoryItem,
+    public readonly parent: AppGroupTreeItem,
+  ) {
     super(item.appdisplayname || item.appname, vscode.TreeItemCollapsibleState.None);
     this.description = item.appversion;
     const tooltipLines = [item.description || item.appname];
@@ -81,6 +84,20 @@ export class InventoryTreeProvider implements vscode.TreeDataProvider<InventoryT
 
   private treeView: vscode.TreeView<InventoryTreeNode> | undefined;
 
+  // The exact AppGroupTreeItem instances the tree view is currently
+  // rendering at the root — kept so expandAll() can reveal() the same
+  // objects VS Code already has in its model, rather than ones freshly
+  // built (and re-fetched from the server) just for the reveal call.
+  private lastGroups: AppGroupTreeItem[] = [];
+
+  // The raw inventory behind lastGroups — kept so collapseAll() (see below)
+  // can force a full root rebuild without an extra round trip to the server.
+  private lastItems: InventoryItem[] | undefined;
+
+  // Set by collapseAll() to make the *next* getChildren(undefined) rebuild
+  // fresh AppGroupTreeItem instances from lastItems instead of re-fetching.
+  private reuseCache = false;
+
   constructor(
     private client: TornadoClient | undefined,
     private readonly output: vscode.OutputChannel,
@@ -108,26 +125,75 @@ export class InventoryTreeProvider implements vscode.TreeDataProvider<InventoryT
     return element;
   }
 
+  // Required for treeView.reveal(), which expandAll() uses.
+  getParent(element: InventoryTreeNode): InventoryTreeNode | undefined {
+    return element instanceof InventoryTreeItem ? element.parent : undefined;
+  }
+
   async getChildren(element?: InventoryTreeNode): Promise<InventoryTreeNode[]> {
     if (element instanceof AppGroupTreeItem) {
-      return element.items.map((item) => new InventoryTreeItem(item));
+      return element.items.map((item) => new InventoryTreeItem(item, element));
     }
     if (element || !this.client) {
       return [];
     }
+    if (this.reuseCache && this.lastItems) {
+      this.reuseCache = false;
+      this.lastGroups = groupSortedByAppGroupThenName(this.lastItems);
+      return this.lastGroups;
+    }
+    this.reuseCache = false;
     try {
       const items = await this.client.fetchInventory();
       if (this.treeView) {
         this.treeView.message = undefined;
       }
-      return groupSortedByAppGroupThenName(items);
+      this.lastItems = items;
+      this.lastGroups = groupSortedByAppGroupThenName(items);
+      return this.lastGroups;
     } catch (error) {
       const message = `Failed to load Tornado inventory: ${(error as Error).message}`;
       this.output.appendLine(message);
       if (this.treeView) {
         this.treeView.message = message;
       }
+      this.lastGroups = [];
       return [];
     }
+  }
+
+  // Expands every appgroup at once, via reveal() on each of the root nodes
+  // currently known to the view.
+  async expandAll(): Promise<void> {
+    if (!this.treeView) {
+      return;
+    }
+    if (this.lastGroups.length === 0) {
+      await this.getChildren();
+    }
+    for (const group of this.lastGroups) {
+      await this.treeView.reveal(group, { expand: true, select: false, focus: false });
+    }
+  }
+
+  // Collapses every appgroup at once. TreeView has no "collapse this node"
+  // API — mutating an already-rendered AppGroupTreeItem's collapsibleState
+  // and firing a change event *for that element* does nothing observable:
+  // the widget's expand/collapse state is its own UI state keyed by node
+  // identity, not re-derived from collapsibleState on a per-element
+  // refresh (tried, confirmed to silently no-op).
+  //
+  // What does work: firing onDidChangeTreeData with no element, which makes
+  // VS Code discard and rebuild the whole root. Since AppGroupTreeItem sets
+  // no explicit `id`, VS Code can't map the old (possibly-expanded) nodes to
+  // the freshly-built ones, so every rebuilt group renders at its declared
+  // default state (Collapsed) — the same reason a full refresh normally
+  // "loses" expand state without ids, deliberately used here rather than
+  // fought. `reuseCache` avoids the network round trip a plain refresh()
+  // would otherwise trigger, by rebuilding from the last-fetched inventory
+  // instead of re-fetching it.
+  collapseAll(): void {
+    this.reuseCache = true;
+    this.refresh();
   }
 }

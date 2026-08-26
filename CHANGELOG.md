@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.14
+
+- Added: `Tornado: Close Application`, from right-clicking a synced app's
+  folder in the Explorer (or the Command Palette). Prompts to confirm, then
+  deletes the local copy — purely local, nothing is pushed to or deleted
+  from the server. Stops the app's watcher first if it's running, and
+  removes the `java.project.sourcePaths`/`java.project.referencedLibraries`
+  entries `ensureJavaIntelliSense` added for it, leaving the workspace as
+  if the app had never been synced. The shared `tornado/.lib/<connectionId>/`
+  jar cache is left alone, since other synced apps on the same connection
+  still need it.
+
 ## 0.0.13
 
 - Fixed: the Java editor (IntelliSense) still couldn't resolve types from a

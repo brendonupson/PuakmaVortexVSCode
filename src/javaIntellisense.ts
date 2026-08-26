@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "node:path";
 import { JAVA_SOURCE_FOLDERS, findSharedCodeJars } from "./javaCompiler";
 
 const REFERENCED_LIBRARIES_KEY = "project.referencedLibraries";
@@ -18,11 +19,11 @@ type ReferencedLibraries =
 // Merges `entries` into java.project.referencedLibraries (skipping ones
 // already present) and drops any of `stale` found there. Returns true if
 // the setting was actually changed.
-function updateReferencedLibraries(
+async function updateReferencedLibraries(
   config: vscode.WorkspaceConfiguration,
   entries: string[],
   stale: string[],
-): boolean {
+): Promise<boolean> {
   const current = config.inspect<ReferencedLibraries>(REFERENCED_LIBRARIES_KEY)?.workspaceValue;
   const currentList = Array.isArray(current) ? current : (current?.include ?? []);
 
@@ -35,7 +36,7 @@ function updateReferencedLibraries(
 
   const updated: ReferencedLibraries =
     current && !Array.isArray(current) ? { ...current, include: merged } : merged;
-  void config.update(REFERENCED_LIBRARIES_KEY, updated, vscode.ConfigurationTarget.Workspace);
+  await config.update(REFERENCED_LIBRARIES_KEY, updated, vscode.ConfigurationTarget.Workspace);
   return true;
 }
 
@@ -48,7 +49,7 @@ function updateReferencedLibraries(
 // field in SharedCode can fail to resolve from an Action right after a
 // fresh sync. Declaring java.project.sourcePaths explicitly removes the
 // guesswork instead of waiting on that detection or a compile.
-function addSourcePaths(config: vscode.WorkspaceConfiguration, appFolder: vscode.Uri): boolean {
+async function addSourcePaths(config: vscode.WorkspaceConfiguration, appFolder: vscode.Uri): Promise<boolean> {
   const relAppFolder = vscode.workspace.asRelativePath(appFolder, false);
   const newPaths = JAVA_SOURCE_FOLDERS.map((folder) => `${relAppFolder}/${folder}`);
 
@@ -58,7 +59,7 @@ function addSourcePaths(config: vscode.WorkspaceConfiguration, appFolder: vscode
     return false;
   }
 
-  void config.update(SOURCE_PATHS_KEY, [...current, ...missing], vscode.ConfigurationTarget.Workspace);
+  await config.update(SOURCE_PATHS_KEY, [...current, ...missing], vscode.ConfigurationTarget.Workspace);
   return true;
 }
 
@@ -91,7 +92,11 @@ export async function ensureJavaIntelliSense(
   // also feeds the actual compile classpath) needs its own explicit entry,
   // since it lives outside that glob's reach.
   const sharedCodeJars = await findSharedCodeJars(appFolder);
-  const librariesChanged = updateReferencedLibraries(config, [LIB_GLOB, ...sharedCodeJars], [OBSOLETE_LIB_GLOB]);
+  const librariesChanged = await updateReferencedLibraries(
+    config,
+    [LIB_GLOB, ...sharedCodeJars],
+    [OBSOLETE_LIB_GLOB],
+  );
   if (librariesChanged) {
     output.appendLine(
       "Updated java.project.referencedLibraries (workspace settings) with the server jar glob" +
@@ -99,9 +104,42 @@ export async function ensureJavaIntelliSense(
         ".",
     );
   }
-  const sourcePathsChanged = addSourcePaths(config, appFolder);
+  const sourcePathsChanged = await addSourcePaths(config, appFolder);
   if (sourcePathsChanged) {
     output.appendLine(`Added ${appFolder.fsPath}'s source folders to java.project.sourcePaths (workspace settings).`);
   }
   return librariesChanged || sourcePathsChanged;
+}
+
+// Reverses ensureJavaIntelliSense for one app folder — used by "Close
+// Application" so java.project.sourcePaths/referencedLibraries don't keep
+// stale entries pointing at a folder that's about to stop existing. Only
+// removes entries scoped to this app (its own source folders, its own
+// SharedCode jars); the shared tornado/.lib/**/*.jar glob — and the
+// tornado/.lib/<connectionId>/ cache it points at — are left alone, since
+// other still-open apps on the same connection depend on both.
+export async function removeJavaIntelliSense(output: vscode.OutputChannel, appFolder: vscode.Uri): Promise<void> {
+  if (!vscode.extensions.getExtension(JAVA_EXTENSION_ID)) {
+    return;
+  }
+  const config = vscode.workspace.getConfiguration("java");
+
+  const relPrefix = `${vscode.workspace.asRelativePath(appFolder, false)}/`;
+  const currentSourcePaths = config.inspect<string[]>(SOURCE_PATHS_KEY)?.workspaceValue ?? [];
+  const prunedSourcePaths = currentSourcePaths.filter((p) => !p.startsWith(relPrefix));
+  if (prunedSourcePaths.length !== currentSourcePaths.length) {
+    await config.update(SOURCE_PATHS_KEY, prunedSourcePaths, vscode.ConfigurationTarget.Workspace);
+    output.appendLine(`Removed ${appFolder.fsPath}'s source folders from java.project.sourcePaths.`);
+  }
+
+  const absPrefix = appFolder.fsPath + path.sep;
+  const current = config.inspect<ReferencedLibraries>(REFERENCED_LIBRARIES_KEY)?.workspaceValue;
+  const currentList = Array.isArray(current) ? current : (current?.include ?? []);
+  const prunedList = currentList.filter((e) => !e.startsWith(absPrefix));
+  if (prunedList.length !== currentList.length) {
+    const updated: ReferencedLibraries =
+      current && !Array.isArray(current) ? { ...current, include: prunedList } : prunedList;
+    await config.update(REFERENCED_LIBRARIES_KEY, updated, vscode.ConfigurationTarget.Workspace);
+    output.appendLine(`Removed ${appFolder.fsPath}'s SharedCode jar(s) from java.project.referencedLibraries.`);
+  }
 }

@@ -216,6 +216,18 @@ are now implemented (with some deliberate gaps noted below). See the
   built-in commands like "Refresh Explorer" directly, so this is a
   companion button rather than the native one gaining new behavior.
 
+- **Closing an application**: `Tornado: Close Application`, from
+  right-clicking a synced app's folder in the Explorer (or the Command
+  Palette, which then prompts you to pick one), deletes that app's local
+  folder after a confirmation prompt — nothing is pushed to or deleted from
+  the server, it's purely local. Stops the app's watcher first if it's
+  running, and cleans up the `java.project.sourcePaths`/
+  `java.project.referencedLibraries` workspace-setting entries
+  `ensureJavaIntelliSense` added for it (the shared `tornado/.lib/**/*.jar`
+  glob is left in place, since other synced apps still need it), so nothing
+  about the closed app lingers. The folder goes to the OS trash where
+  available.
+
 - **Editing design element properties**: `Tornado: Edit Design Element
   Properties`, from the Command Palette (using the active editor's file) or
   by right-clicking a design element file in the Explorer, opens a picker

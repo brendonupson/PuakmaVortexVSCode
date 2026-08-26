@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -84,6 +84,10 @@
       {
         "command": "tornado.refreshServerLibraries",
         "title": "Tornado: Refresh Server Libraries"
+      },
+      {
+        "command": "tornado.closeApplication",
+        "title": "Tornado: Close Application"
       },
       {
         "command": "tornado.editDesignElementProperties",
@@ -216,6 +220,11 @@
           "command": "tornado.editKeywords",
           "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*$/",
           "group": "7_modification@3"
+        },
+        {
+          "command": "tornado.closeApplication",
+          "when": "resourceScheme == file && explorerResourceIsFolder && resourcePath =~ /\\/tornado\\/[^.\\/][^\\/]*$/",
+          "group": "9_close@1"
         }
       ],
       "view/title": [

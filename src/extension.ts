@@ -44,7 +44,7 @@ import { AppWatcher } from "./appWatcher";
 import { openKeywordEditor } from "./keywordEditor";
 import { createOutputChannel, logError, traceCommand } from "./logging";
 import { compileApp, ensureServerLibraries } from "./javaCompiler";
-import { ensureJavaIntelliSense } from "./javaIntellisense";
+import { ensureJavaIntelliSense, removeJavaIntelliSense } from "./javaIntellisense";
 import { JavaCompileStatusProvider } from "./javaCompileStatus";
 
 async function buildClient(
@@ -1525,6 +1525,75 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.showInformationMessage(`Refreshed server libraries for "${connectionName}".`);
       } catch (error) {
         logError(output, `Refreshing server libraries failed: ${(error as Error).message}`);
+        output.show(true);
+        vscode.window.showErrorMessage((error as Error).message);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    registerTracedCommand("tornado.closeApplication", async (uri?: vscode.Uri) => {
+      const folder = uri ?? (await pickSyncedAppFolder("Select an application to close"));
+      if (!folder) {
+        return;
+      }
+      const manifest = await readManifest(folder);
+      if (!manifest) {
+        vscode.window.showErrorMessage(`No manifest found in ${folder.fsPath}.`);
+        return;
+      }
+
+      const appLabel = folder.fsPath.split("/").pop() ?? folder.fsPath;
+      const closeAction = "Close & Delete Local Copy";
+      const confirmed = await vscode.window.showWarningMessage(
+        `Close "${appLabel}" and delete its local copy at ${folder.fsPath}?`,
+        {
+          modal: true,
+          detail:
+            "Only the local copy is removed — nothing is pushed to or deleted from the Tornado " +
+            "server. Watching (if active) is stopped first. The folder goes to the OS trash where " +
+            "available, so this is usually recoverable there, but not from within the extension.",
+        },
+        closeAction,
+      );
+      if (confirmed !== closeAction) {
+        return;
+      }
+
+      try {
+        // Stop watching *before* deleting — the watcher treats a local
+        // delete as the user removing design elements and would prompt to
+        // delete them server-side too, which "Close" must never do. Matched
+        // by appFolder.fsPath rather than the map key (folder.toString())
+        // since this folder — unlike every other activeWatchers lookup —
+        // can come straight from an Explorer right-click rather than a URI
+        // the extension built itself.
+        const watcherEntry = [...activeWatchers.entries()].find(
+          ([, watcher]) => watcher.appFolder.fsPath === folder.fsPath,
+        );
+        if (watcherEntry) {
+          const [key, watcher] = watcherEntry;
+          watcher.dispose();
+          activeWatchers.delete(key);
+          output.appendLine(`Stopped watching ${folder.fsPath} before closing it.`);
+        }
+
+        // .lib/<connectionId>/ (the shared jar cache) is deliberately left
+        // in place — it's keyed per-connection, not per-app, so other synced
+        // apps on the same connection still need it.
+        await removeJavaIntelliSense(output, folder);
+        compileStatus.clearFolder(folder);
+
+        try {
+          await vscode.workspace.fs.delete(folder, { recursive: true, useTrash: true });
+        } catch {
+          await vscode.workspace.fs.delete(folder, { recursive: true, useTrash: false });
+          output.appendLine("  (deleted permanently — the trash was unavailable)");
+        }
+        output.appendLine(`Closed "${appLabel}" — deleted the local copy at ${folder.fsPath}.`);
+        vscode.window.showInformationMessage(`Closed "${appLabel}" and removed its local copy.`);
+      } catch (error) {
+        logError(output, `Closing "${appLabel}" failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
       }

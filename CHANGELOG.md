@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.9
+
+- Fixed: the Inventory view's "Collapse All" button didn't actually collapse
+  anything (0.0.8 regression). It now delegates to VS Code's own built-in
+  collapse-all implementation instead of the extension trying to do it
+  itself.
+
 ## 0.0.8
 
 - Editing `.tornado-manifest.json` directly on disk — e.g. by an AI coding

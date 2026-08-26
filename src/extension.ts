@@ -1161,8 +1161,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    registerTracedCommand("tornado.collapseAllAppGroups", () => {
-      treeProvider.collapseAll();
+    registerTracedCommand("tornado.collapseAllAppGroups", async () => {
+      // Two home-grown approaches (mutating collapsibleState + a per-element
+      // change event; a full no-arg refresh relying on no `id` being set) both
+      // failed to actually collapse anything in practice, despite matching
+      // the documented/expected TreeView behavior. This delegates to VS
+      // Code's own internal implementation instead — the exact command its
+      // native "Collapse All" button (enabled via showCollapseAll in
+      // package.json) invokes — since that's the one thing guaranteed to
+      // actually work.
+      await vscode.commands.executeCommand("workbench.actions.treeView.tornadoInventory.collapseAll");
     }),
   );
 

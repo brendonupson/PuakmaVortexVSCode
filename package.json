@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -80,6 +80,10 @@
       {
         "command": "tornado.compileAndUpload",
         "title": "Tornado: Compile & Upload Java"
+      },
+      {
+        "command": "tornado.compileHealthCheck",
+        "title": "Tornado: Compile Health Check"
       },
       {
         "command": "tornado.refreshServerLibraries",

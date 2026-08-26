@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import { createHash } from "node:crypto";
+import * as path from "node:path";
 import {
   addConnection,
   getActiveConnection,
@@ -29,6 +31,7 @@ import {
   DEV_CONFIG_RELATIVE_PATH,
   Manifest,
   ManifestEntry,
+  MANIFEST_FILENAME,
   designTypeFolder,
   ensureDevConfig,
   fileNameFor,
@@ -43,7 +46,7 @@ import {
 import { AppWatcher } from "./appWatcher";
 import { openKeywordEditor } from "./keywordEditor";
 import { createOutputChannel, logError, traceCommand } from "./logging";
-import { compileApp, ensureServerLibraries } from "./javaCompiler";
+import { CompileDiagnostic, compileApp, ensureServerLibraries, SERVER_LIB_FOLDER } from "./javaCompiler";
 import { ensureJavaIntelliSense, removeJavaIntelliSense } from "./javaIntellisense";
 import { JavaCompileStatusProvider } from "./javaCompileStatus";
 
@@ -188,9 +191,70 @@ async function syncDesignToFolder(
 
 export interface CompileAndUploadSummary {
   uploaded: number;
+  unchanged: number;
   skipped: number;
   hadErrors: boolean;
   failedSourceNames: string[];
+}
+
+// ecj batch-compiles every source together on every run (see
+// JAVA_SOURCE_FOLDERS in javaCompiler.ts) and zbin/ is wiped each time, so
+// without this a single edited Action still re-uploads every other
+// unchanged class too. Source is folded in for top-level classes (empty for
+// nested ones, which never carry designsource) so a source-only edit that
+// happens not to change the compiled bytecode still re-uploads and keeps
+// the server's designsource in sync with what's on disk.
+function hashUpload(classBytes: Uint8Array, sourceBytes: Uint8Array): string {
+  return createHash("sha256").update(classBytes).update(sourceBytes).digest("hex");
+}
+
+// Populates VS Code's native Problems panel (and editor squiggles) with
+// ecj's actual diagnostics for this batch — reset for every source in the
+// batch on every compile (not just the ones with a problem this time), so a
+// file that's now clean doesn't leave a stale entry behind. The range
+// covers the whole reported line rather than the exact token: ecj's caret
+// line would let this be pinned more precisely, but reproducing its
+// tab/space column math reliably isn't worth it for what's still a useful,
+// correctly-positioned squiggle.
+function updateJavaDiagnostics(
+  collection: vscode.DiagnosticCollection,
+  sourceFsPaths: readonly string[],
+  diagnostics: readonly CompileDiagnostic[],
+): void {
+  const byFile = new Map<string, vscode.Diagnostic[]>();
+  for (const d of diagnostics) {
+    const line = Math.max(0, d.line - 1);
+    const range = new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER);
+    const diagnostic = new vscode.Diagnostic(
+      range,
+      d.message,
+      d.severity === "error" ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning,
+    );
+    diagnostic.source = "Tornado (ecj)";
+    const list = byFile.get(d.fsPath) ?? [];
+    list.push(diagnostic);
+    byFile.set(d.fsPath, list);
+  }
+  for (const fsPath of sourceFsPaths) {
+    collection.set(vscode.Uri.file(fsPath), byFile.get(fsPath) ?? []);
+  }
+}
+
+// Same folder-scoping as JavaCompileStatusProvider.clearFolder(), so a
+// wiped-and-resynced or closed app doesn't leave stale entries in the
+// Problems panel for files that are about to be recreated or are simply
+// gone.
+function clearJavaDiagnosticsForFolder(collection: vscode.DiagnosticCollection, folder: vscode.Uri): void {
+  const prefix = folder.fsPath + path.sep;
+  const toClear: vscode.Uri[] = [];
+  collection.forEach((uri) => {
+    if (uri.fsPath.startsWith(prefix)) {
+      toClear.push(uri);
+    }
+  });
+  for (const uri of toClear) {
+    collection.delete(uri);
+  }
 }
 
 // Shared by the tornado.compileAndUpload command and the auto-compile-on-save
@@ -205,6 +269,7 @@ async function compileAndUploadFolder(
   output: vscode.OutputChannel,
   folder: vscode.Uri,
   compileStatus: JavaCompileStatusProvider,
+  javaDiagnostics: vscode.DiagnosticCollection,
 ): Promise<CompileAndUploadSummary | undefined> {
   const manifest = await readManifest(folder);
   if (!manifest) {
@@ -218,9 +283,12 @@ async function compileAndUploadFolder(
   // Badge every source in this batch green/red in the Explorer, regardless
   // of whether its class made it onto the server below.
   compileStatus.record(result.sourceFiles, new Set(result.erroredSourceFiles));
+  updateJavaDiagnostics(javaDiagnostics, result.sourceFiles, result.diagnostics);
 
   let uploaded = 0;
+  let unchanged = 0;
   let skipped = 0;
+  let manifestChanged = false;
   for (const classFileUri of result.classFiles) {
     const fileName = classFileUri.path.split("/").pop() ?? "";
     const className = fileName.replace(/\.class$/, "");
@@ -234,12 +302,19 @@ async function compileAndUploadFolder(
     }
 
     const classBytes = await vscode.workspace.fs.readFile(classFileUri);
+    let sourceBytes: Uint8Array = new Uint8Array(0);
     let sourceBase64 = "";
     try {
-      const sourceBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder, entry.path));
+      sourceBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder, entry.path));
       sourceBase64 = Buffer.from(sourceBytes).toString("base64");
     } catch {
       output.appendLine(`  ${entry.path} not found — uploading compiled class without refreshing source.`);
+    }
+
+    const hash = hashUpload(classBytes, sourceBytes);
+    if (entry.uploadedHash === hash) {
+      unchanged++;
+      continue;
     }
 
     const payload: DesignElementPayload = {
@@ -256,6 +331,8 @@ async function compileAndUploadFolder(
       designparams: entry.designparams,
     };
     await client.updateDesignElement(manifest.appid, entry.designbucketid, payload);
+    entry.uploadedHash = hash;
+    manifestChanged = true;
     output.appendLine(`Uploaded compiled "${entry.name}" (${classBytes.length} bytes).`);
     uploaded++;
   }
@@ -264,15 +341,19 @@ async function compileAndUploadFolder(
   // their own to match a manifest entry by name — they're deployed as
   // SharedCode (designtype 4), created on the server the first time each
   // one is seen and updated in place on every compile after that.
-  let manifestChanged = false;
   for (const classFileUri of result.nestedClassFiles) {
     const fileName = classFileUri.path.split("/").pop() ?? "";
     const className = fileName.replace(/\.class$/, "");
     const classBytes = await vscode.workspace.fs.readFile(classFileUri);
     const designdata = Buffer.from(classBytes).toString("base64");
+    const hash = hashUpload(classBytes, new Uint8Array(0));
 
     const entry = manifest.elements.find((e) => e.name === className && e.designtype === 4);
     if (entry) {
+      if (entry.uploadedHash === hash) {
+        unchanged++;
+        continue;
+      }
       const payload: DesignElementPayload = {
         designbucketid: entry.designbucketid,
         appid: manifest.appid,
@@ -287,6 +368,8 @@ async function compileAndUploadFolder(
         designparams: entry.designparams,
       };
       await client.updateDesignElement(manifest.appid, entry.designbucketid, payload);
+      entry.uploadedHash = hash;
+      manifestChanged = true;
       output.appendLine(`Uploaded compiled nested class "${className}" (${classBytes.length} bytes).`);
       uploaded++;
       continue;
@@ -316,6 +399,7 @@ async function compileAndUploadFolder(
       comment: created.comment,
       options: created.options,
       designparams: created.designparams,
+      uploadedHash: hash,
     });
     manifestChanged = true;
     output.appendLine(
@@ -327,7 +411,7 @@ async function compileAndUploadFolder(
     await writeManifestFile(folder, manifest);
   }
 
-  return { uploaded, skipped, hadErrors: result.hadErrors, failedSourceNames: result.failedSourceNames };
+  return { uploaded, unchanged, skipped, hadErrors: result.hadErrors, failedSourceNames: result.failedSourceNames };
 }
 
 type FolderResetChoice = "fresh" | "merge" | "cancel";
@@ -346,6 +430,7 @@ async function confirmAndResetAppFolder(
   output: vscode.OutputChannel,
   activeWatchers: Map<string, AppWatcher>,
   compileStatus: JavaCompileStatusProvider,
+  javaDiagnostics: vscode.DiagnosticCollection,
 ): Promise<FolderResetChoice> {
   let entries: [string, vscode.FileType][];
   try {
@@ -417,6 +502,7 @@ async function confirmAndResetAppFolder(
   await vscode.workspace.fs.createDirectory(folder);
   output.appendLine(`Deleted the local copy at ${folder.fsPath} before syncing a fresh one.`);
   compileStatus.clearFolder(folder);
+  clearJavaDiagnosticsForFolder(javaDiagnostics, folder);
 
   if (devConfig) {
     const devConfigUri = vscode.Uri.joinPath(folder, DEV_CONFIG_RELATIVE_PATH);
@@ -436,6 +522,9 @@ function appPathLabel(app: Pick<InventoryItem, "appgroup" | "appname">): string 
 
 function formatCompileSummary(result: CompileAndUploadSummary): string {
   const parts = [`uploaded ${result.uploaded} Java design element(s)`];
+  if (result.unchanged > 0) {
+    parts.push(`${result.unchanged} unchanged (not re-uploaded)`);
+  }
   if (result.skipped > 0) {
     parts.push(`${result.skipped} skipped (no matching design element)`);
   }
@@ -845,6 +934,43 @@ async function pickSyncedAppFolder(placeHolder: string): Promise<vscode.Uri | un
   return picked?.folder;
 }
 
+// After "Tornado: Close Application" deletes one app's folder, its
+// connection's tornado/.lib/<connectionId>/ cache (see SERVER_LIB_FOLDER in
+// javaCompiler.ts) is only worth keeping if some other synced app on that
+// same connection still exists — otherwise it's just orphaned disk usage a
+// future sync/refresh would re-download from scratch anyway.
+async function pruneOrphanedLibraryCache(
+  tornadoRoot: vscode.Uri,
+  connectionId: string,
+  output: vscode.OutputChannel,
+): Promise<void> {
+  const libDir = vscode.Uri.joinPath(tornadoRoot, SERVER_LIB_FOLDER, connectionId);
+  try {
+    await vscode.workspace.fs.stat(libDir);
+  } catch {
+    return; // Nothing cached for this connection — nothing to prune.
+  }
+
+  const manifests = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(tornadoRoot, `*/${MANIFEST_FILENAME}`),
+  );
+  for (const uri of manifests) {
+    const manifest = await readManifest(vscode.Uri.joinPath(uri, ".."));
+    if (manifest?.connectionId === connectionId) {
+      return; // Still referenced by another synced app on this connection.
+    }
+  }
+
+  try {
+    await vscode.workspace.fs.delete(libDir, { recursive: true, useTrash: true });
+  } catch {
+    await vscode.workspace.fs.delete(libDir, { recursive: true, useTrash: false });
+  }
+  output.appendLine(
+    `No other synced app uses connection "${connectionId}" — deleted its shared library cache at ${libDir.fsPath}.`,
+  );
+}
+
 // Given a file open in the editor (or right-clicked in the Explorer), walks
 // up its ancestors looking for a synced app's manifest — a design element's
 // path is always exactly two levels under its app folder (<DesignTypeFolder>/
@@ -911,6 +1037,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // after every manual or auto-compile-on-save run (see javaCompileStatus.ts).
   const compileStatus = new JavaCompileStatusProvider();
   context.subscriptions.push(compileStatus, vscode.window.registerFileDecorationProvider(compileStatus));
+
+  // The actual ecj error/warning messages, same lifecycle as compileStatus
+  // above (updated by compileAndUploadFolder every compile) — this is what
+  // makes a broken class visible in VS Code's native Problems panel and as
+  // an editor squiggle, not just a red badge with no detail.
+  const javaDiagnostics = vscode.languages.createDiagnosticCollection("tornado-java");
+  context.subscriptions.push(javaDiagnostics);
 
   const treeProvider = new InventoryTreeProvider(undefined, output);
   const treeView = vscode.window.createTreeView("tornadoInventory", {
@@ -1233,7 +1366,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // its delete handler can't mistake the wipe for the user removing
           // design elements. Restarted after the sync if it was running.
           const wasWatching = activeWatchers.has(folder.toString());
-          const reset = await confirmAndResetAppFolder(folder, output, activeWatchers, compileStatus);
+          const reset = await confirmAndResetAppFolder(folder, output, activeWatchers, compileStatus, javaDiagnostics);
           if (reset === "cancel") {
             output.appendLine(`Sync of "${app.appname}" cancelled — the local copy was left alone.`);
             return;
@@ -1245,7 +1378,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               location: vscode.ProgressLocation.Notification,
               title: `Syncing "${appPathLabel(app)}"...`,
             },
-            () => syncDesignToFolder(context, output, activeWatchers, folder, appid, connection.id),
+            // forceLibraryRefresh: true — this is also the click-to-sync path
+            // from the Inventory tree, so a stale .lib cache from an earlier
+            // session shouldn't silently linger every time an app is opened.
+            () => syncDesignToFolder(context, output, activeWatchers, folder, appid, connection.id, true),
           );
 
           if (wasWatching) {
@@ -1482,7 +1618,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       try {
-        const result = await compileAndUploadFolder(context, output, folder, compileStatus);
+        const result = await compileAndUploadFolder(context, output, folder, compileStatus, javaDiagnostics);
         if (!result) {
           vscode.window.showInformationMessage("No .java sources found to compile.");
           return;
@@ -1497,6 +1633,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         logError(output, `Compile & upload failed: ${(error as Error).message}`);
         output.show(true);
         vscode.window.showErrorMessage((error as Error).message);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    registerTracedCommand("tornado.compileHealthCheck", async (uri?: vscode.Uri) => {
+      const folder = uri ?? (await pickSyncedAppFolder("Select an application to check compile health for"));
+      if (!folder) {
+        return;
+      }
+      const appLabel = folder.fsPath.split("/").pop() ?? folder.fsPath;
+
+      // Reads the status recorded by the app's last actual compile (Compile
+      // & Upload, or auto-compile-on-save) rather than triggering a new
+      // one — a quick "what's currently broken" check, not another build.
+      if (!compileStatus.hasRecordedStatus(folder)) {
+        vscode.window.showInformationMessage(
+          `"${appLabel}" hasn't been compiled yet this session — run "Tornado: Compile & Upload Java" ` +
+            "first, then check again.",
+        );
+        return;
+      }
+
+      const errored = compileStatus.erroredFiles(folder);
+      if (errored.length === 0) {
+        vscode.window.showInformationMessage(`"${appLabel}": no compile errors as of its last compile.`);
+        return;
+      }
+
+      const picked = await vscode.window.showQuickPick(
+        errored
+          .map((fsPath) => {
+            const messages = (javaDiagnostics.get(vscode.Uri.file(fsPath)) ?? []).map((d) => d.message);
+            return {
+              label: fsPath.split("/").pop() ?? fsPath,
+              description: vscode.workspace.asRelativePath(fsPath, false),
+              detail: messages.length > 0 ? messages.join(" · ") : "(no ecj message recorded for this file)",
+              fsPath,
+            };
+          })
+          .sort((a, b) => a.label.localeCompare(b.label)),
+        {
+          placeHolder: `${errored.length} class(es) with compile errors in "${appLabel}" — select one to open it`,
+          matchOnDetail: true,
+        },
+      );
+      if (picked) {
+        const document = await vscode.workspace.openTextDocument(picked.fsPath);
+        await vscode.window.showTextDocument(document);
       }
     }),
   );
@@ -1578,11 +1763,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           output.appendLine(`Stopped watching ${folder.fsPath} before closing it.`);
         }
 
-        // .lib/<connectionId>/ (the shared jar cache) is deliberately left
-        // in place — it's keyed per-connection, not per-app, so other synced
-        // apps on the same connection still need it.
         await removeJavaIntelliSense(output, folder);
         compileStatus.clearFolder(folder);
+        clearJavaDiagnosticsForFolder(javaDiagnostics, folder);
 
         try {
           await vscode.workspace.fs.delete(folder, { recursive: true, useTrash: true });
@@ -1591,6 +1774,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           output.appendLine("  (deleted permanently — the trash was unavailable)");
         }
         output.appendLine(`Closed "${appLabel}" — deleted the local copy at ${folder.fsPath}.`);
+
+        // .lib/<connectionId>/ (the shared jar cache) is keyed per-connection,
+        // not per-app — only worth deleting once no other synced app on this
+        // connection needs it any more.
+        const tornadoRoot = vscode.Uri.joinPath(folder, "..");
+        await pruneOrphanedLibraryCache(tornadoRoot, manifest.connectionId, output);
+
         vscode.window.showInformationMessage(`Closed "${appLabel}" and removed its local copy.`);
       } catch (error) {
         logError(output, `Closing "${appLabel}" failed: ${(error as Error).message}`);
@@ -2114,7 +2304,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     compilingFolders.add(key);
     output.appendLine(`Auto-compiling ${folder.fsPath} after saving "${savedRelativePath}"...`);
     try {
-      const result = await compileAndUploadFolder(context, output, folder, compileStatus);
+      const result = await compileAndUploadFolder(context, output, folder, compileStatus, javaDiagnostics);
       if (result) {
         output.appendLine(`Auto-compile: ${formatCompileSummary(result)}.`);
         // Only pop a toast for sources that produced no output at all —

@@ -27,7 +27,7 @@ export const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"]
 // skipped by handleCreate's existing unrecognised-folder check.
 export const COMPILE_OUTPUT_FOLDER = "zbin";
 
-const SERVER_LIB_FOLDER = ".lib"; // sits alongside app folders, directly under tornado/
+export const SERVER_LIB_FOLDER = ".lib"; // sits alongside app folders, directly under tornado/
 const SYSTEM_JAR_FILENAME = "puakma.jar";
 const LIBRARIES_ZIP_FILENAME = "libraries.zip";
 const LIBRARIES_EXTRACT_FOLDER = "libraries";
@@ -216,6 +216,13 @@ export async function ensureEcj(globalStorageUri: vscode.Uri, output: vscode.Out
   return jarUri.fsPath;
 }
 
+export interface CompileDiagnostic {
+  fsPath: string;
+  line: number; // 1-based, as ecj reports it
+  severity: "error" | "warning";
+  message: string;
+}
+
 export interface CompileResult {
   classFiles: vscode.Uri[]; // top-level only — one per compiled source, matched to its design element by name
   nestedClassFiles: vscode.Uri[]; // nested/inner/anonymous classes (e.g. Foo$Bar.class) — no source maps to these, so they're uploaded as SharedCode design elements instead, created on the server the first time each one is seen (see compileAndUploadFolder)
@@ -223,22 +230,59 @@ export interface CompileResult {
   failedSourceNames: string[]; // base names (no extension) of sources that produced no class at all, even as a stub
   sourceFiles: string[]; // every .java fsPath in this batch — paired with erroredSourceFiles to badge the Explorer (see JavaCompileStatusProvider)
   erroredSourceFiles: string[]; // fsPaths (of sourceFiles) ecj reported an error against, including ones in failedSourceNames
+  diagnostics: CompileDiagnostic[]; // one per ecj problem, with its actual message — see compileAndUploadFolder's use of it to populate the Problems panel
 }
 
-// ecj's batch-compile diagnostics list each problem as
-// "<n>. ERROR in <path> (at line <n>)" (or WARNING) — parsed here to
-// attribute errors back to the specific source that has them, since
-// hadErrors above only says the batch as a whole had a problem somewhere.
-// This is ecj's plain-text output format, not a stable contract, but the
-// version is pinned above so it isn't going to shift under us.
-function parseErrorSourcePaths(output: string): Set<string> {
-  const paths = new Set<string>();
-  const regex = /^\d+\.\s+ERROR in (.+?)(?:\s*\(at line \d+\))?\s*$/gm;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(output))) {
-    paths.add(match[1].trim());
+// ecj's batch-compile diagnostics come as "----------"-delimited blocks:
+// a "<n>. ERROR in <path> (at line <n>)" (or WARNING) header, the source
+// line(s) reproduced verbatim, a caret-marker line pointing at the token,
+// then the actual message. Parsed in full (not just which files had a
+// problem) so a specific message can be shown to the user — e.g. surfaced
+// in the Problems panel — instead of just "this file failed" with nothing
+// to go on. This is ecj's plain-text output format, not a stable contract,
+// but the version is pinned above so it isn't going to shift under us.
+function parseEcjDiagnostics(output: string): CompileDiagnostic[] {
+  const diagnostics: CompileDiagnostic[] = [];
+  // "(at line N)" is omitted by ecj for some diagnostic categories (e.g. a
+  // few whole-file-scoped problems) — kept optional here, same as the
+  // previous file-path-only parser did, so such a diagnostic still counts
+  // rather than silently vanishing (and its file along with it, since
+  // erroredSourceFiles is now derived from this list). Falls back to line 1
+  // when absent.
+  const headerRe = /^\s*\d+\.\s+(ERROR|WARNING) in (.+?)(?:\s*\(at line (\d+)\))?\s*$/m;
+  for (const block of output.split(/^-{10,}$/m)) {
+    const header = headerRe.exec(block);
+    if (!header) {
+      continue;
+    }
+    const [full, severityText, file, lineText] = header;
+    const rest = block
+      .slice((header.index ?? 0) + full.length)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    // The caret line (all "^") marks where the source excerpt ends and the
+    // message begins — searched from the end since the excerpt itself could
+    // span multiple lines.
+    let caretIndex = -1;
+    for (let i = rest.length - 1; i >= 0; i--) {
+      if (/^\^+$/.test(rest[i])) {
+        caretIndex = i;
+        break;
+      }
+    }
+    const message = (caretIndex >= 0 ? rest.slice(caretIndex + 1) : rest).join(" ").trim();
+    if (!message) {
+      continue;
+    }
+    diagnostics.push({
+      fsPath: file.trim(),
+      line: lineText ? parseInt(lineText, 10) : 1,
+      severity: severityText === "ERROR" ? "error" : "warning",
+      message,
+    });
   }
-  return paths;
+  return diagnostics;
 }
 
 export async function compileApp(
@@ -356,7 +400,8 @@ export async function compileApp(
         "affected source(s) may throw at runtime if the broken part is actually reached.",
     );
   }
-  const erroredSourceFiles = parseErrorSourcePaths(combinedOutput);
+  const diagnostics = parseEcjDiagnostics(combinedOutput);
+  const erroredSourceFiles = new Set(diagnostics.filter((d) => d.severity === "error").map((d) => d.fsPath));
 
   const compiled = await vscode.workspace.fs.readDirectory(outDir);
   const classFiles: vscode.Uri[] = [];
@@ -387,10 +432,20 @@ export async function compileApp(
     .filter((name) => !compiledNames.has(name));
   // A source with no output at all is definitely broken even though ecj
   // never got the chance to print an "ERROR in <path>" line for it (e.g. a
-  // file so malformed it can't be parsed at all).
+  // file so malformed it can't be parsed at all) — give it a synthetic
+  // diagnostic too, so it still shows up with *some* message rather than
+  // silently having none.
   for (const file of sourceFiles) {
     if (failedSourceNames.includes(path.basename(file, ".java"))) {
       erroredSourceFiles.add(file);
+      if (!diagnostics.some((d) => d.fsPath === file && d.severity === "error")) {
+        diagnostics.push({
+          fsPath: file,
+          line: 1,
+          severity: "error",
+          message: "Produced no compiled output at all — see the Tornado output channel for the full ecj error.",
+        });
+      }
     }
   }
 
@@ -408,5 +463,6 @@ export async function compileApp(
     failedSourceNames,
     sourceFiles,
     erroredSourceFiles: [...erroredSourceFiles],
+    diagnostics,
   };
 }

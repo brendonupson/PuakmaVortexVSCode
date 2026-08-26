@@ -224,9 +224,14 @@ are now implemented (with some deliberate gaps noted below). See the
   running, and cleans up the `java.project.sourcePaths`/
   `java.project.referencedLibraries` workspace-setting entries
   `ensureJavaIntelliSense` added for it (the shared `tornado/.lib/**/*.jar`
-  glob is left in place, since other synced apps still need it), so nothing
-  about the closed app lingers. The folder goes to the OS trash where
-  available.
+  glob itself is left in place, since other synced apps still need it), so
+  nothing about the closed app lingers. The folder goes to the OS trash
+  where available. Also checks whether any other synced app under
+  `tornado/` still uses that app's connection; if none do,
+  `tornado/.lib/<connectionId>/` (the downloaded `puakma.jar`/shared
+  libraries for that connection, see "Compiling Java" below) is deleted too
+  rather than left behind as orphaned disk usage — a future sync/refresh on
+  that connection just re-downloads it from scratch.
 
 - **Editing design element properties**: `Tornado: Edit Design Element
   Properties`, from the Command Palette (using the active editor's file) or
@@ -561,13 +566,17 @@ are now implemented (with some deliberate gaps noted below). See the
   same code, and sidesteps having to bundle or license a third-party
   server-framework jar. Both are cached per-connection under
   `tornado/.lib/<connectionId>/` (shared across every app synced from that
-  connection) and only re-downloaded if missing — this happens
-  automatically on every sync/refresh (`syncDesignToFolder()` in
-  `extension.ts`, non-fatal if it fails, so a server without these
-  endpoints doesn't break a normal file sync), not only lazily on first
-  compile, so the classpath is warm as soon as an app is connected. Run
-  `Tornado: Refresh Server Libraries` after a server-side upgrade to force
-  a fresh copy.
+  connection). This happens automatically on every sync/refresh
+  (`syncDesignToFolder()` in `extension.ts`, non-fatal if it fails, so a
+  server without these endpoints doesn't break a normal file sync), not
+  only lazily on first compile, so the classpath is warm as soon as an app
+  is connected. Clicking an app in the Inventory tree (`Tornado: Sync
+  Application to Workspace`) and `Tornado: Refresh from Server` both force a
+  fresh download rather than reusing the cache, so an app being opened or
+  refreshed never silently runs against last session's jars; `Tornado:
+  Create Application`'s sync half still reuses the cache if present, for a
+  faster first-time create. `Tornado: Refresh Server Libraries` forces a
+  fresh copy on demand, without touching any app's design elements.
   `tornado.compileClasspath` (a settings array, empty by default) can add
   extra jar/directory paths on top of the server-provided ones if needed.
 
@@ -615,7 +624,16 @@ are now implemented (with some deliberate gaps noted below). See the
     it.
 
   After compiling, each resulting top-level class is matched back to its
-  manifest entry by class name and uploaded via the same
+  manifest entry by class name. ecj batch-compiles every source together on
+  every run (they can reference each other), so a save that only touched
+  one file still recompiles all of them — but each one is only uploaded if
+  its compiled bytecode or its current `.java` text actually differs from
+  what was last successfully uploaded for it: a SHA-256 hash of both is
+  kept as `uploadedHash` on the element's manifest entry, purely a local
+  record (never sent to the server, never touched by the manual-manifest-
+  edit param push described above), and cleared by a fresh sync/refresh —
+  so the first compile after one re-uploads once per touched element and
+  tracks incrementally from there. When it does upload, it's the same
   `PUT /vortex/{appid}/design/{designbucketid}` used elsewhere, with both
   `designdata` (the compiled bytecode) and `designsource` (the current
   `.java` text) refreshed in the same request, so both server-side fields
@@ -624,13 +642,14 @@ are now implemented (with some deliberate gaps noted below). See the
   Nested/inner/anonymous classes (any `.class` file with `$` in its name,
   e.g. `Outer$Inner.class`) have no `.java` of their own to match a manifest
   entry by name, so they're deployed separately as SharedCode design
-  elements (designtype 4): updated in place if a same-named SharedCode
-  element already exists, or created via `POST /vortex/{appid}/design` the
-  first time one is seen, with the new `designbucketid` recorded in the
-  manifest. Only `designdata` (the bytecode) is sent — there's no source to
-  put in `designsource`. On sync, these come back down as a plain `.class`
-  file (never a `.java`), so they're never mistaken for a real source file
-  and fed back into `ecj`.
+  elements (designtype 4), with the same unchanged-skip behaviour: updated
+  in place if a same-named SharedCode element already exists and its
+  bytecode changed, or created via `POST /vortex/{appid}/design` the first
+  time one is seen, with the new `designbucketid` recorded in the manifest.
+  Only `designdata` (the bytecode) is sent — there's no source to put in
+  `designsource`. On sync, these come back down as a plain `.class` file
+  (never a `.java`), so they're never mistaken for a real source file and
+  fed back into `ecj`.
 
   **A broken file doesn't hold back the rest of the app**: because of
   `-proceedOnError` above, `CompileResult.failedSourceNames` (sources that
@@ -642,6 +661,25 @@ are now implemented (with some deliberate gaps noted below). See the
   uploaded run is logged to the output channel only, since under this
   model that's routine, not exceptional — the whole point is that transient
   errors elsewhere shouldn't interrupt saving.
+
+  **Per-file status**: every compile (manual or auto-compile-on-save)
+  badges each `Actions`/`SharedCode`/`ScheduledActions` `.java` file green
+  or red in the Explorer (`JavaCompileStatusProvider`, a
+  `FileDecorationProvider`), and ecj's actual diagnostics (not just which
+  files failed) are parsed out of its output and published to VS Code's
+  native Problems panel and as editor squiggles (`vscode.DiagnosticCollection`,
+  source `"Tornado (ecj)"`) — so a broken file, and *why* it's broken, is
+  visible without hunting through the output channel or waiting to hit the
+  `-proceedOnError` stub's `java.lang.Error` at runtime on the server.
+  `Tornado: Compile Health Check` reads that same recorded status for a
+  chosen app — it does **not** trigger a new compile — and lists any
+  currently-errored classes in a QuickPick, each with its ecj message(s) as
+  the item detail; picking one opens it. If the app hasn't been compiled
+  this session yet, it says so instead of reporting a false "no errors."
+  Diagnostics only cover what ecj reports at the *token* it's pointing
+  at — the squiggle spans the whole reported line rather than the exact
+  token, since reproducing ecj's caret-line column math reliably wasn't
+  worth it for a still-correctly-positioned marker.
 
   **Auto-compile on save**: while an app is being watched, saving any
   `.java` file under Actions/SharedCode/ScheduledActions triggers this same

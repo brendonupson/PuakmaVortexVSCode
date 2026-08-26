@@ -216,6 +216,14 @@ export interface ManifestEntry {
   comment: string;
   options: string;
   designparams: DesignParam[];
+  // SHA-256 hex digest of the compiled .class bytes + source .java bytes
+  // (source omitted for nested classes) as of the last successful upload
+  // via compileAndUploadFolder(). Absent after any fresh sync/refresh —
+  // writeDesignElements() never sets it, so the first compile after a sync
+  // re-uploads once per touched element and starts tracking incrementally
+  // from there. Purely a local cache of "what did we last send"; never
+  // synced by diffManifestParams() and never sent to the server itself.
+  uploadedHash?: string;
 }
 
 export interface Manifest {

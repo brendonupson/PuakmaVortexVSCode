@@ -47,6 +47,33 @@ export class JavaCompileStatusProvider implements vscode.FileDecorationProvider,
     }
   }
 
+  // Used by "Tornado: Compile Health Check" to tell "never compiled" apart
+  // from "compiled cleanly" — both report zero errored files, but only one
+  // means there's actually a recorded status to trust.
+  hasRecordedStatus(folder: vscode.Uri): boolean {
+    const prefix = folder.fsPath + path.sep;
+    for (const fsPath of this.statuses.keys()) {
+      if (fsPath.startsWith(prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Same folder-scoping as clearFolder(), but reading instead of deleting —
+  // the fsPaths (of sourceFsPaths passed to the last record() call for this
+  // folder) that ecj reported an error against.
+  erroredFiles(folder: vscode.Uri): string[] {
+    const prefix = folder.fsPath + path.sep;
+    const errored: string[] = [];
+    for (const [fsPath, status] of this.statuses) {
+      if (status === "error" && fsPath.startsWith(prefix)) {
+        errored.push(fsPath);
+      }
+    }
+    return errored;
+  }
+
   // Called when an app folder is wiped and re-synced fresh, so a badge from
   // the old copy doesn't linger on a file that's about to be recreated (or
   // no longer exists) until the next compile.

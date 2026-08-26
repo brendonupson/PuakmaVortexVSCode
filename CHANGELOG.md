@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.0.15
+
+- Fixed: recompiling only re-uploaded a class if its compiled bytecode (or
+  its source) actually changed since the last successful upload, instead of
+  re-uploading every class in the app on every compile. Tracked as a
+  SHA-256 hash per design element in `.tornado-manifest.json`, cleared by
+  every fresh sync/refresh.
+- Fixed: clicking an app in the Inventory tree now forces a fresh pull of
+  the server's shared libraries (`puakma.jar`/`libraries.zip`) after the
+  delete/download prompt, instead of silently reusing a stale `.lib` cache
+  — same as `Refresh from Server` already does.
+- Added: closing an application (`Tornado: Close Application`) now also
+  deletes its connection's `tornado/.lib/<connectionId>/` shared library
+  cache, if no other synced app still uses that connection.
+- Added: `Tornado: Compile Health Check` — pick a synced app and see which
+  of its classes currently have compile errors (from the last compile, no
+  new compile triggered), with each one's actual ecj message shown; picking
+  one opens the file.
+- Added: ecj's diagnostics are now parsed in full and published to VS
+  Code's native Problems panel (and as editor squiggles), not just a
+  red/green Explorer badge with no detail.
+
 ## 0.0.14
 
 - Added: `Tornado: Close Application`, from right-clicking a synced app's

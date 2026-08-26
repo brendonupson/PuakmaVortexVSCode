@@ -53,7 +53,7 @@ const JAVA_SOURCE_DESIGN_TYPES = new Set([3, 4, 6]); // Actions, SharedCode, Sch
 // even though its extension isn't forced to .java like the set above.
 const SOURCE_FIELD_DESIGN_TYPES = new Set([3, 4, 5, 6]);
 
-const JAR_CONTENT_TYPE = "application/java-archive";
+export const JAR_CONTENT_TYPE = "application/java-archive";
 const JAVA_MIME_TYPES = new Set(["application/java", "application/octet-stream", "application/javavm"]);
 const JAVA_CONTENT_TYPE = "application/java";
 

@@ -3,7 +3,13 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { TornadoClient } from "./tornadoClient";
-import { AGENT_INSTRUCTION_FILENAMES, DEV_CONFIG_RELATIVE_PATH, readDevConfig } from "./designSync";
+import {
+  AGENT_INSTRUCTION_FILENAMES,
+  DEV_CONFIG_RELATIVE_PATH,
+  JAR_CONTENT_TYPE,
+  readDevConfig,
+  readManifest,
+} from "./designSync";
 import { logError } from "./logging";
 
 const execFileAsync = promisify(execFile);
@@ -80,6 +86,27 @@ async function findJarsRecursive(dir: vscode.Uri): Promise<string[]> {
     }
   }
   return results;
+}
+
+// A SharedCode element with contenttype application/java-archive doesn't
+// always end up with a .jar extension on disk — e.g. a name containing "$"
+// gets written as "<name>.class" instead (see isNestedJavaClassName in
+// designSync.ts), a jar contenttype under a non-bare-name designtype keeps
+// whatever extension its name already had, or none. The manifest's
+// contenttype field is the only reliable signal, so it's consulted first;
+// the plain .jar filesystem scan stays as a fallback for jars not (yet)
+// reflected there — a pre-manifest sync, or one manually dropped in.
+async function findSharedCodeJars(appFolder: vscode.Uri): Promise<string[]> {
+  const manifest = await readManifest(appFolder);
+  const jarPaths = new Set(
+    (manifest?.elements ?? [])
+      .filter((element) => element.contenttype.trim().toLowerCase() === JAR_CONTENT_TYPE)
+      .map((element) => vscode.Uri.joinPath(appFolder, element.path).fsPath),
+  );
+  for (const fsPath of await findJarsRecursive(vscode.Uri.joinPath(appFolder, "SharedCode"))) {
+    jarPaths.add(fsPath);
+  }
+  return [...jarPaths];
 }
 
 async function extractLibrariesZip(zipUri: vscode.Uri, destDir: vscode.Uri): Promise<void> {
@@ -246,9 +273,7 @@ export async function compileApp(
   // lives, alongside (not inside) any particular app's folder.
   const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
   const serverClasspath = await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
-  // Jar-type design elements always sync into SharedCode (see designSync.ts's
-  // useSourceField), so that's the only app folder worth scanning for them.
-  const sharedCodeJars = await findJarsRecursive(vscode.Uri.joinPath(appFolder, "SharedCode"));
+  const sharedCodeJars = await findSharedCodeJars(appFolder);
   const extraClasspath = vscode.workspace.getConfiguration("tornado").get<string[]>("compileClasspath", []);
   const classpath = [...serverClasspath, ...sharedCodeJars, ...extraClasspath];
 

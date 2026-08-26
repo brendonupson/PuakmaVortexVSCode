@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.12
+
+- Fixed: a SharedCode jar (`application/java-archive`) wasn't always picked
+  up on the compile classpath if its filename didn't end in `.jar` — e.g.
+  an element whose name contains `$` syncs as `<name>.class` instead, and
+  a jar synced under a non-SharedCode designtype keeps whatever extension
+  its name already had. The classpath scan now reads `contenttype` from
+  `.tornado-manifest.json` (the reliable signal) instead of relying on the
+  file extension, falling back to the previous `.jar`-suffix scan for jars
+  not yet reflected in the manifest.
+
 ## 0.0.11
 
 - Fixed: `.jar` files synced as SharedCode design elements were silently

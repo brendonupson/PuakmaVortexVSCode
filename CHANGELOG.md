@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.10
+
+- "Tornado: Refresh from Server" now forces a fresh pull of the server's
+  shared libraries (previously it silently reused a `.lib` cache if one
+  already existed), so `CLAUDE.md`/`AGENTS.md` mirrored into the app folder
+  are refreshed along with everything else the command promises to bring
+  current. "Sync Application" and "Create Application" are unchanged — they
+  still reuse a cached library set when present, for faster first-time opens.
+
 ## 0.0.9
 
 - Fixed: the Inventory view's "Collapse All" button didn't actually collapse

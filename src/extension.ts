@@ -123,6 +123,7 @@ async function syncDesignToFolder(
   appFolder: vscode.Uri,
   appid: number,
   connectionId: string,
+  forceLibraryRefresh = false,
 ): Promise<DesignSyncResult> {
   const { client } = await buildClientForConnection(context, output, connectionId);
 
@@ -169,7 +170,7 @@ async function syncDesignToFolder(
   // otherwise-successful file sync.
   try {
     const tornadoRoot = vscode.Uri.joinPath(appFolder, "..");
-    await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
+    await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output, forceLibraryRefresh);
     const justConfigured = await ensureJavaIntelliSense(output);
     if (justConfigured) {
       vscode.window.showInformationMessage(
@@ -1428,7 +1429,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             location: vscode.ProgressLocation.Notification,
             title: `Refreshing "${folder.fsPath.split("/").pop()}"...`,
           },
-          () => syncDesignToFolder(context, output, activeWatchers, folder, manifest.appid, manifest.connectionId),
+          () =>
+            syncDesignToFolder(
+              context,
+              output,
+              activeWatchers,
+              folder,
+              manifest.appid,
+              manifest.connectionId,
+              true,
+            ),
         );
         vscode.window.showInformationMessage(
           `Refreshed ${result.written} design element(s) in ${folder.fsPath}`,

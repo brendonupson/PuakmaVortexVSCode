@@ -137,6 +137,9 @@ export class AppWatcher implements vscode.Disposable {
 
   private async handleCreate(uri: vscode.Uri): Promise<void> {
     const relativePath = this.toRelativePath(uri);
+    if (!relativePath) {
+      return;
+    }
     // An atomic write (write-temp-then-rename — e.g. an AI coding agent's
     // edit tool, or "sed -i") changes the file's inode, which some file
     // watchers surface as a delete+create instead of a change. Route it the
@@ -153,18 +156,23 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
 
+    // Already tracked in the manifest — same atomic-write cause as the
+    // manifest case above: an existing file rewritten via write-then-rename
+    // can surface here as a create instead of a change, and the new content
+    // still needs uploading. handleChange() does exactly that (and is a
+    // harmless re-upload of unchanged content for a genuinely spurious
+    // duplicate create event).
+    if (this.findEntry(relativePath)) {
+      return this.handleChange(uri);
+    }
+
     // devconfig.json is a real Documentation element once the server has one,
     // and is then tracked in the manifest like anything else — edits to it
-    // upload via handleChange. It's skipped only *here*, on create: reaching
+    // upload via the findEntry() branch above. It's skipped only *here*: past
     // this point means it isn't in the manifest, i.e. the push in
     // ensureDevConfig didn't succeed, and re-attempting it as an incidental
     // file creation isn't this watcher's job.
-    if (
-      !relativePath ||
-      relativePath === DEV_CONFIG_RELATIVE_PATH ||
-      AGENT_INSTRUCTION_FILENAMES.includes(relativePath) ||
-      this.findEntry(relativePath)
-    ) {
+    if (relativePath === DEV_CONFIG_RELATIVE_PATH || AGENT_INSTRUCTION_FILENAMES.includes(relativePath)) {
       return;
     }
     if (relativePath.startsWith(DATA_CONNECTIONS_FOLDER)) {

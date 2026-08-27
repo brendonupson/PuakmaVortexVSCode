@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.20
+
+- Fixed: the 0.0.19 fix only covered the manifest — the same atomic-write
+  cause (write-temp-then-rename, as an AI coding agent's edit tool or
+  `sed -i` does) applied to any already-tracked design element file (a
+  `Resources/`, `Pages/`, `Actions/`, etc. file) too. `handleCreate()`
+  silently no-opped whenever the rewritten file was already in the
+  manifest, on the assumption a create event for a tracked file could only
+  be a spurious duplicate notification. It now re-uploads through the same
+  path `onDidChange` uses, which is a harmless no-op for a genuinely
+  spurious duplicate and the fix for an atomic rewrite.
+
 ## 0.0.19
 
 - Fixed: a manifest edit written via an atomic write (write-temp-then-rename,

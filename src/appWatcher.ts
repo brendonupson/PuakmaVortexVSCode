@@ -56,6 +56,13 @@ function columnPayload(column: ManifestColumn): NewColumnPayload {
 export class AppWatcher implements vscode.Disposable {
   private readonly watcher: vscode.FileSystemWatcher;
   private suppressed = false;
+  // An atomic write to the manifest (write-temp-then-rename) can fire both
+  // onDidCreate and onDidChange for the same save. Both route to
+  // handleManifestChange(), which is not reentrant-safe — it reads the
+  // manifest, mutates `this.manifest`, and awaits server calls that write
+  // ids back into it. Chaining every call onto this tail promise queues
+  // them instead of letting two runs interleave against the same object.
+  private manifestChangeQueue: Promise<void> = Promise.resolve();
 
   constructor(
     readonly appFolder: vscode.Uri,
@@ -121,13 +128,31 @@ export class AppWatcher implements vscode.Disposable {
     await writeManifestFile(this.appFolder, this.manifest);
   }
 
+  // Queues onto manifestChangeQueue rather than calling handleManifestChange()
+  // directly — see the comment on that field.
+  private queueManifestChange(): Promise<void> {
+    this.manifestChangeQueue = this.manifestChangeQueue.then(() => this.handleManifestChange());
+    return this.manifestChangeQueue;
+  }
+
   private async handleCreate(uri: vscode.Uri): Promise<void> {
+    const relativePath = this.toRelativePath(uri);
+    // An atomic write (write-temp-then-rename — e.g. an AI coding agent's
+    // edit tool, or "sed -i") changes the file's inode, which some file
+    // watchers surface as a delete+create instead of a change. Route it the
+    // same place handleChange() would, or a manifest edit made this way
+    // would silently never push. Checked before stat() below: during the
+    // rename this path can momentarily fail to stat, and the manifest is
+    // known to always be a file anyway.
+    if (relativePath === MANIFEST_FILENAME) {
+      return this.queueManifestChange();
+    }
+
     const stat = await vscode.workspace.fs.stat(uri);
     if (stat.type !== vscode.FileType.File) {
       return;
     }
 
-    const relativePath = this.toRelativePath(uri);
     // devconfig.json is a real Documentation element once the server has one,
     // and is then tracked in the manifest like anything else — edits to it
     // upload via handleChange. It's skipped only *here*, on create: reaching
@@ -136,7 +161,6 @@ export class AppWatcher implements vscode.Disposable {
     // file creation isn't this watcher's job.
     if (
       !relativePath ||
-      relativePath === MANIFEST_FILENAME ||
       relativePath === DEV_CONFIG_RELATIVE_PATH ||
       AGENT_INSTRUCTION_FILENAMES.includes(relativePath) ||
       this.findEntry(relativePath)
@@ -218,7 +242,7 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
     if (relativePath === MANIFEST_FILENAME) {
-      return this.handleManifestChange();
+      return this.queueManifestChange();
     }
 
     const entry = this.findEntry(relativePath);

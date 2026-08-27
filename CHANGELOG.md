@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.19
+
+- Fixed: a manifest edit written via an atomic write (write-temp-then-rename,
+  as an AI coding agent's edit tool or `sed -i` does) could arrive at the
+  watcher as a file creation rather than a change, which was silently
+  ignored for `.tornado-manifest.json` — `appparams`/`designparams`/
+  `dataconnections` edits made that way never pushed, even though the same
+  edit made by hand and saved in VS Code did. `onDidCreate` now routes the
+  manifest to the same push path as `onDidChange`, and both are serialized
+  onto a single queue so a create+change pair from the same save can't run
+  the manifest push concurrently against the shared in-memory manifest.
+
 ## 0.0.18
 
 - Added: data connections, tables, and columns can now be edited by hand

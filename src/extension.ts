@@ -39,6 +39,7 @@ import {
   isNestedJavaClassName,
   readManifest,
   supportsDesignParams,
+  toManifestDataConnections,
   useSourceField,
   writeDesignElements,
   writeManifestFile,
@@ -151,9 +152,14 @@ async function syncDesignToFolder(
     // Best-effort metadata for local AI tooling — a data connection only
     // shows up once the app that owns it is opened, so this is the point to
     // catch it. Never let a failure here (a bad connection name, a write
-    // error) look like the design sync itself failed.
+    // error) look like the design sync itself failed. The editable manifest
+    // baseline is refreshed in the same try/catch and re-persisted here
+    // rather than left to ensureDevConfig's write above, since that only
+    // rewrites the manifest when this app has no devconfig.json yet.
     try {
       await writeDataConnections(appFolder, design.dataconnections);
+      written.manifest.dataconnections = toManifestDataConnections(design.dataconnections);
+      await writeManifestFile(appFolder, written.manifest);
     } catch (error) {
       logError(output, `Failed to write DataConnections metadata: ${(error as Error).message}`);
     }

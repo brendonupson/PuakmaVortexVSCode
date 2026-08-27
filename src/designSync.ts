@@ -1,5 +1,14 @@
 import * as vscode from "vscode";
-import { AppParam, DesignElement, DesignParam, NewDesignElementPayload, TornadoClient } from "./tornadoClient";
+import {
+  AppParam,
+  Column,
+  DataConnection,
+  DesignElement,
+  DesignParam,
+  NewDesignElementPayload,
+  Table,
+  TornadoClient,
+} from "./tornadoClient";
 import { assertSafePathSegment } from "./workspaceStorage";
 import { logError } from "./logging";
 
@@ -226,6 +235,55 @@ export interface ManifestEntry {
   uploadedHash?: string;
 }
 
+// A column as it sits in the manifest — every field the server's <column>
+// shape carries except attributeid/tableid, which are handled separately:
+// tableid is implied by nesting (a column always sits inside its table's
+// "columns" array) and attributeid is present once the server has assigned
+// one, absent on a row added locally that hasn't been created yet. Field
+// types match the wire shape exactly (typesize and the "1"/"0" flags stay
+// strings) — see the comment on tornadoClient.ts's Column.
+export interface ManifestColumn {
+  attributeid?: number;
+  attributename: string;
+  type: string;
+  typesize: string;
+  allownull: string;
+  isprimarykey: string;
+  reftable: string;
+  extraoptions: string;
+  cascadedelete: string;
+  autoincrement: string;
+  isunique: string;
+  ftindex: string;
+  description: string;
+}
+
+// A table as it sits in the manifest, dbconnectionid dropped for the same
+// reason a column's tableid is: implied by nesting. tableid is absent on a
+// table added locally that hasn't been created yet.
+export interface ManifestTable {
+  tableid?: number;
+  tablename: string;
+  buildorder: number;
+  description: string;
+  columns: ManifestColumn[];
+}
+
+// A data connection as it sits in the manifest. dbconnectionid is always
+// present — there is no create-connection endpoint, so a manifest entry
+// without one could never be pushed and would just be silently useless.
+// schema (the raw auto-generated DDL dump) is deliberately left out: it is
+// never accepted by the PUT and is already on disk as DataConnections/
+// {connectionname}.sql, so keeping it here too would just be a second,
+// driftable copy of the same read-only text.
+export interface ManifestDataConnection {
+  dbconnectionid: number;
+  connectionname: string;
+  databasename: string;
+  comment: string;
+  tables: ManifestTable[];
+}
+
 export interface Manifest {
   appid: number;
   connectionId: string;
@@ -236,6 +294,50 @@ export interface Manifest {
   // never defaulted to [] — diffManifestParams() below depends on that.
   appparams: AppParam[] | undefined;
   elements: ManifestEntry[];
+  // Same "no trustworthy baseline" semantics as appparams above, and for the
+  // same reason: undefined (a manifest from before this feature existed)
+  // must never be treated as "empty," or the first edit after upgrading
+  // would read as "delete every data connection" — see
+  // diffManifestDataConnections() below.
+  dataconnections: ManifestDataConnection[] | undefined;
+}
+
+// Strips schema and the redundant nesting ids out of a fetched
+// DataConnection[] to produce the manifest's editable baseline — the
+// inverse of what applyDataConnectionsDiff() sends back piece by piece.
+export function toManifestDataConnections(dataconnections: DataConnection[]): ManifestDataConnection[] {
+  const toManifestColumn = (column: Column): ManifestColumn => ({
+    attributeid: column.attributeid,
+    attributename: column.attributename,
+    type: column.type,
+    typesize: column.typesize,
+    allownull: column.allownull,
+    isprimarykey: column.isprimarykey,
+    reftable: column.reftable,
+    extraoptions: column.extraoptions,
+    cascadedelete: column.cascadedelete,
+    autoincrement: column.autoincrement,
+    isunique: column.isunique,
+    ftindex: column.ftindex,
+    description: column.description,
+  });
+  const toManifestTable = (table: Table): ManifestTable => ({
+    tableid: table.tableid,
+    tablename: table.tablename,
+    buildorder: table.buildorder,
+    description: table.description,
+    // Defensive: extractDataConnections()/the wire type assert this shape
+    // rather than validate it, so an older server missing "columns" must not
+    // take the whole sync down with a TypeError.
+    columns: (table.columns ?? []).map(toManifestColumn),
+  });
+  return dataconnections.map((connection) => ({
+    dbconnectionid: connection.dbconnectionid,
+    connectionname: connection.connectionname,
+    databasename: connection.databasename,
+    comment: connection.comment,
+    tables: (connection.tables ?? []).map(toManifestTable),
+  }));
 }
 
 export async function readManifest(appFolder: vscode.Uri): Promise<Manifest | undefined> {
@@ -432,7 +534,9 @@ export async function writeDesignElements(
   // Persisted so the upload watcher can map a local file back to its
   // designbucketid without another round trip — the window (and any
   // in-memory state) is gone as soon as the workspace folder is opened.
-  const manifest: Manifest = { appid, connectionId, appparams, elements: manifestEntries };
+  // dataconnections isn't known here — the caller (syncDesignToFolder) sets
+  // it and rewrites the manifest once writeDataConnections() has also run.
+  const manifest: Manifest = { appid, connectionId, appparams, elements: manifestEntries, dataconnections: undefined };
   await writeManifestFile(appFolder, manifest);
   output?.appendLine(`  wrote ${MANIFEST_FILENAME}`);
 
@@ -544,6 +648,243 @@ export function diffManifestParams(
   for (const path of prevByPath.keys()) {
     if (!nextByPath.has(path)) {
       output?.appendLine(`  ${MANIFEST_FILENAME}: "${path}" was removed — not deleted on the server by this feature.`);
+    }
+  }
+
+  return diff;
+}
+
+// Field-by-field string/number equality, deliberately not paramsEqual()'s
+// by-name map comparison: typesize and every flag field are significant
+// strings ("0" is not the same absence as ""), so normalising anything here
+// would make an untouched column look changed and re-PUT it every save.
+function columnFieldsEqual(a: ManifestColumn, b: ManifestColumn): boolean {
+  return (
+    a.attributename === b.attributename &&
+    a.type === b.type &&
+    a.typesize === b.typesize &&
+    a.allownull === b.allownull &&
+    a.isprimarykey === b.isprimarykey &&
+    a.reftable === b.reftable &&
+    a.extraoptions === b.extraoptions &&
+    a.cascadedelete === b.cascadedelete &&
+    a.autoincrement === b.autoincrement &&
+    a.isunique === b.isunique &&
+    a.ftindex === b.ftindex &&
+    a.description === b.description
+  );
+}
+
+function tableFieldsEqual(a: ManifestTable, b: ManifestTable): boolean {
+  return a.tablename === b.tablename && a.buildorder === b.buildorder && a.description === b.description;
+}
+
+function connectionFieldsEqual(a: ManifestDataConnection, b: ManifestDataConnection): boolean {
+  return a.connectionname === b.connectionname && a.databasename === b.databasename && a.comment === b.comment;
+}
+
+export interface DataConnectionFieldChange {
+  dbconnectionid: number;
+  connectionname: string;
+  databasename: string;
+  comment: string;
+}
+
+export interface NewManifestTable {
+  dbconnectionid: number;
+  table: ManifestTable;
+}
+
+export interface ManifestTableChange {
+  dbconnectionid: number;
+  tableid: number;
+  fields?: { tablename: string; buildorder: number; description: string };
+  newColumns: ManifestColumn[];
+  // Always has a real attributeid — only reached once a column has been
+  // matched to a baseline entry by id (see diffManifestDataConnections) —
+  // typed this way so callers never need an unchecked assertion to address
+  // it in a URL.
+  changedColumns: (ManifestColumn & { attributeid: number })[];
+  removedColumnIds: number[];
+}
+
+export interface RemovedManifestTable {
+  dbconnectionid: number;
+  tableid: number;
+  tablename: string;
+}
+
+export interface RemovedManifestConnection {
+  dbconnectionid: number;
+  connectionname: string;
+}
+
+export interface ManifestDataConnectionsDiff {
+  connectionChanges: DataConnectionFieldChange[];
+  newTables: NewManifestTable[];
+  tableChanges: ManifestTableChange[];
+  // Reported separately from everything above so the caller can confirm
+  // before running anything destructive — unlike diffManifestParams(),
+  // which never reports a removal at all, this section's whole point is
+  // full schema editing, additions and removals both.
+  removedTables: RemovedManifestTable[];
+  removedConnections: RemovedManifestConnection[];
+}
+
+// Compares two snapshots of the manifest's "dataconnections" baseline.
+// Unlike diffManifestParams() above (which only ever reports value edits,
+// never an add or a remove), this reports every create/update/removal —
+// new/renamed/deleted tables and columns are the point of this section, not
+// just editing existing values. Nothing here calls the server; the caller
+// decides what to do with a removal (see AppWatcher.handleManifestChange).
+//
+// undefined baseline (either side) mirrors appparams: "no trustworthy
+// baseline" must never be treated as "empty," so a manifest predating this
+// feature (previous === undefined) never produces a diff, and the key being
+// removed entirely (next === undefined) is refused rather than read as
+// "delete every data connection."
+export function diffManifestDataConnections(
+  previous: ManifestDataConnection[] | undefined,
+  next: ManifestDataConnection[] | undefined,
+  output?: vscode.OutputChannel,
+): ManifestDataConnectionsDiff | undefined {
+  if (previous === undefined) {
+    if (next !== undefined) {
+      output?.appendLine(
+        `  ${MANIFEST_FILENAME}: "dataconnections" has no baseline (this app hasn't been synced or ` +
+          'refreshed since this feature shipped) — not pushing. Run "Tornado: Refresh from Server" once, ' +
+          "then edit dataconnections again.",
+      );
+    }
+    return undefined;
+  }
+  if (next === undefined) {
+    output?.appendLine(
+      `  ${MANIFEST_FILENAME}: "dataconnections" key was removed — not pushing (that would delete every ` +
+        'data connection on the server). Restore it or run "Tornado: Refresh from Server" to reset the baseline.',
+    );
+    return undefined;
+  }
+
+  const diff: ManifestDataConnectionsDiff = {
+    connectionChanges: [],
+    newTables: [],
+    tableChanges: [],
+    removedTables: [],
+    removedConnections: [],
+  };
+
+  const prevByDbId = new Map(previous.map((c) => [c.dbconnectionid, c]));
+  const nextByDbId = new Map(next.map((c) => [c.dbconnectionid, c]));
+
+  for (const [dbconnectionid, nextConn] of nextByDbId) {
+    const prevConn = prevByDbId.get(dbconnectionid);
+    if (!prevConn) {
+      output?.appendLine(
+        `  ${MANIFEST_FILENAME}: data connection ${dbconnectionid} is new — not created on the server ` +
+          "(there is no create-connection endpoint).",
+      );
+      continue;
+    }
+    if (!connectionFieldsEqual(prevConn, nextConn)) {
+      diff.connectionChanges.push({
+        dbconnectionid,
+        connectionname: nextConn.connectionname,
+        databasename: nextConn.databasename,
+        comment: nextConn.comment,
+      });
+    }
+
+    const prevTablesById = new Map<number, ManifestTable>();
+    for (const table of prevConn.tables) {
+      if (table.tableid !== undefined) {
+        prevTablesById.set(table.tableid, table);
+      }
+    }
+    const nextTablesById = new Set<number>();
+
+    for (const nextTable of nextConn.tables) {
+      if (nextTable.tableid === undefined) {
+        diff.newTables.push({ dbconnectionid, table: nextTable });
+        continue;
+      }
+      nextTablesById.add(nextTable.tableid);
+      const prevTable = prevTablesById.get(nextTable.tableid);
+      if (!prevTable) {
+        output?.appendLine(
+          `  ${MANIFEST_FILENAME}: table ${nextTable.tableid} under data connection ${dbconnectionid} ` +
+            "doesn't match anything in the baseline — ignored rather than guessed at. Run " +
+            '"Tornado: Refresh from Server" if it should exist, or remove its "tableid" to create it as new.',
+        );
+        continue;
+      }
+
+      const prevColumnsById = new Map<number, ManifestColumn>();
+      for (const column of prevTable.columns) {
+        if (column.attributeid !== undefined) {
+          prevColumnsById.set(column.attributeid, column);
+        }
+      }
+      const nextColumnIds = new Set<number>();
+      const newColumns: ManifestColumn[] = [];
+      const changedColumns: (ManifestColumn & { attributeid: number })[] = [];
+      for (const nextColumn of nextTable.columns) {
+        if (nextColumn.attributeid === undefined) {
+          newColumns.push(nextColumn);
+          continue;
+        }
+        nextColumnIds.add(nextColumn.attributeid);
+        const prevColumn = prevColumnsById.get(nextColumn.attributeid);
+        if (!prevColumn) {
+          output?.appendLine(
+            `  ${MANIFEST_FILENAME}: column ${nextColumn.attributeid} of table ${nextTable.tableid} ` +
+              "doesn't match anything in the baseline — ignored rather than guessed at. Run " +
+              '"Tornado: Refresh from Server" if it should exist, or remove its "attributeid" to create it as new.',
+          );
+          continue;
+        }
+        if (!columnFieldsEqual(prevColumn, nextColumn)) {
+          // nextColumn.attributeid is already known non-undefined (checked
+          // above) — TS doesn't propagate that through the whole-object push.
+          changedColumns.push(nextColumn as ManifestColumn & { attributeid: number });
+        }
+      }
+      const removedColumnIds: number[] = [];
+      for (const attributeid of prevColumnsById.keys()) {
+        if (!nextColumnIds.has(attributeid)) {
+          removedColumnIds.push(attributeid);
+        }
+      }
+
+      const fieldsChanged = !tableFieldsEqual(prevTable, nextTable);
+      if (fieldsChanged || newColumns.length > 0 || changedColumns.length > 0 || removedColumnIds.length > 0) {
+        diff.tableChanges.push({
+          dbconnectionid,
+          tableid: nextTable.tableid,
+          fields: fieldsChanged
+            ? {
+                tablename: nextTable.tablename,
+                buildorder: nextTable.buildorder,
+                description: nextTable.description,
+              }
+            : undefined,
+          newColumns,
+          changedColumns,
+          removedColumnIds,
+        });
+      }
+    }
+
+    for (const [tableid, prevTable] of prevTablesById) {
+      if (!nextTablesById.has(tableid)) {
+        diff.removedTables.push({ dbconnectionid, tableid, tablename: prevTable.tablename });
+      }
+    }
+  }
+
+  for (const [dbconnectionid, prevConn] of prevByDbId) {
+    if (!nextByDbId.has(dbconnectionid)) {
+      diff.removedConnections.push({ dbconnectionid, connectionname: prevConn.connectionname });
     }
   }
 

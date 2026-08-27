@@ -425,6 +425,83 @@ are now implemented (with some deliberate gaps noted below). See the
   - Set `tornado.pushLocalParameterEdits` to `false` to hand-edit the
     manifest offline without triggering a live push.
 
+- **Editing data connections, tables, and columns** (`DBCONNECTION`/
+  `PMATABLE`/`ATTRIBUTE`): unlike everything above, this is hand-editing
+  only — there's no interactive editor for it. Every data connection the app
+  pull returns (`design.dataconnections`), with its tables and their columns
+  embedded, is written into `.tornado-manifest.json`'s `"dataconnections"`
+  section on every sync/refresh, and a direct edit to it — while the app's
+  watcher is running — is picked up and pushed the same way `appparams`/
+  `designparams` edits are, via the same `handleManifestChange()`.
+
+  ```
+  GET    /vortex/{appid}/database              -> {"dataconnections": [...]}
+  GET    /vortex/{appid}/database/{dbid}       -> the bare data connection, tables embedded
+  PUT    /vortex/{appid}/database/{dbid}       body {"database": {connectionname, databasename, comment}}
+  DELETE /vortex/{appid}/database/{dbid}       -> cascades: every column, then every table, then the connection
+
+  GET    /vortex/{appid}/database/{dbid}/table/{id}     -> the bare table, columns embedded
+  POST   /vortex/{appid}/database/{dbid}/table          body {"table": {tablename, buildorder, description}}
+  PUT    /vortex/{appid}/database/{dbid}/table/{id}     body {"table": {...}}
+  DELETE /vortex/{appid}/database/{dbid}/table/{id}     -> cascades: every column, then the table
+
+  POST   /vortex/{appid}/database/{dbid}/table/{id}/column/          body {"column": {...}}
+  PUT    /vortex/{appid}/database/{dbid}/table/{id}/column/{id}      body {"column": {...}}
+  DELETE /vortex/{appid}/database/{dbid}/table/{id}/column/{id}
+  ```
+
+  Every response above that carries a single object (`GET`-by-id, `POST`,
+  `PUT`) is bare — the same convention `GET`/`POST`/`PUT /vortex/{appid}/keywords`
+  settled on. Request bodies stay wrapped (`{"database": {...}}`,
+  `{"table": {...}}`, `{"column": {...}}`) regardless. Only `connectionname`/
+  `databasename`/`comment` are settable on a connection — `dburl`, `dbdriver`,
+  `dbusername`, `dbpassword`, `dburloptions`, `options`, and `inheritfrom` are
+  never exposed by `GET` and can't be set through this API. A column's flag
+  fields (`allownull`, `isprimarykey`, `cascadedelete`, `autoincrement`,
+  `isunique`, `ftindex`) are always the strings `"1"`/`"0"`, never JSON
+  booleans, and `typesize` is always a string too — it can be a compound
+  value like `"6,2"` for `NUMERIC` precision, so it's never parsed as a
+  number. There is deliberately no create-connection endpoint: a manifest
+  entry can rename/re-point/delete a connection, but a brand-new one has to
+  come from wherever connections are actually provisioned server-side.
+
+  - **The manifest is the only editable copy.** `DataConnections/
+    {connectionname}.sql` is still written on every sync — it's the server's
+    raw auto-generated DDL dump, kept as read-only reference for local AI
+    tooling (regenerated on sync/refresh, so it lags a schema edit pushed
+    from the manifest until the next one). Editing it does nothing: the
+    watcher recognises the folder and logs a skip pointing at the manifest
+    instead of trying to interpret it as a design element.
+  - **New tables/columns are identified by a missing id.** A `"tables"` entry
+    with no `"tableid"` (or a column with no `"attributeid"`) is created —
+    `POST`, then the new id is written back into the manifest in place so the
+    next save doesn't create it again. An id that doesn't match anything in
+    the last-known baseline is left alone and logged, rather than guessed at,
+    since that's more likely a stray copy-paste than an intentional create.
+  - **Renaming/re-pointing is a same-id edit**: change `tablename`,
+    `buildorder`, `description`, a column's fields, or a connection's
+    `connectionname`/`databasename`/`comment` while keeping its id, and it's
+    pushed as a `PUT`.
+  - **Removals are confirmed, not silent.** Unlike `appparams`/`designparams`
+    (which never delete anything based on a manifest diff), removing a
+    connection, a table, or a column from the manifest is a real, cascading
+    `DELETE` — so before any of those run, one modal lists everything about
+    to be deleted (including what a connection/table removal cascades into)
+    and asks for confirmation. Declining restores the removed entries back
+    into the manifest (the server still has them) rather than leaving it out
+    of sync; any non-destructive part of the same edit — a rename, a new
+    table — still goes through.
+  - **`dataconnections` needs a baseline first**, exactly like `appparams`: a
+    manifest written before this feature shipped has no baseline to compare
+    against, so an edit to it is skipped (and logged) until `Tornado: Refresh
+    from Server` runs once.
+  - Comparison is field-by-field per connection/table/column, matched by id
+    — reformatting or reordering the JSON never looks like a change, and
+    `typesize`/the flag-field strings are compared exactly (`"0"` and `""`
+    are both real, distinct values, never normalised).
+  - Gated by the same `tornado.pushLocalParameterEdits` setting as
+    `appparams`/`designparams` — there's no separate toggle.
+
 - **Editing keywords** (`KEYWORD` / `KEYWORDDATA`, `keywordEditor.ts`):
   `Tornado: Edit Keywords`, from the Command Palette or by right-clicking a
   synced app's folder in the Explorer, opens **the extension's only webview** —
@@ -468,9 +545,10 @@ are now implemented (with some deliberate gaps noted below). See the
     and nothing else — no network, no remote resources — and all of its
     content is set through `textContent`/`value` rather than `innerHTML`.
 
-  **Reads come from the app pull; only writes have their own endpoints.**
-  Keywords arrive in the existing `GET /vortex/{appid}/` alongside
-  `designelements`, so there is no keyword read endpoint to build:
+  **The editor's own reads come from the app pull; dedicated endpoints also
+  exist for all of it.** Keywords arrive in the existing `GET /vortex/{appid}/`
+  alongside `designelements`, and that's what `fetchKeywords()` still uses,
+  but a full set of keyword-specific endpoints exists too:
 
   ```
   GET    /vortex/{appid}/            (the existing app pull)
@@ -480,18 +558,26 @@ are now implemented (with some deliberate gaps noted below). See the
                         {"keyworddataid": 88, "data": "AU", "keywordorder": 1},
                         {"keyworddataid": 89, "data": "NZ", "keywordorder": null}]}]}
 
+  GET    /vortex/{appid}/keywords          -> {"keywords": [{...}, ...]}
+                                           (same wrapped-list shape as the app pull,
+                                            consistent with {"dataconnections": [...]})
+  GET    /vortex/{appid}/keywords/{kwid}   -> the bare keyword object, {...}
   POST   /vortex/{appid}/keywords          body {"keyword": {...}} (no keywordid)
-                                           -> the created keyword, incl. its new keywordid
+                                           -> the created keyword, as a bare object
   PUT    /vortex/{appid}/keywords/{kwid}   body {"keyword": {...}}
+                                           -> the updated keyword, as a bare object
   DELETE /vortex/{appid}/keywords/{kwid}
   ```
 
-  **These three write endpoints did not exist server-side when this was
-  written** — the contract is as much a spec for the server as a client
-  implementation. The `PUT` sends the whole keyword: its `keyworddata` array
-  replaces what's stored, so a deleted row is expressed by its absence, and
-  rows carry `keyworddataid` only when they already exist. Bodies are wrapped
-  in an object for the same reason the parameter collections are.
+  These all now exist server-side. Request bodies for `POST`/`PUT` stay
+  wrapped as `{"keyword": {...}}` — the server-side convention keeps
+  single-object request bodies wrapped even where the matching response is
+  bare — but every response that carries a single keyword (`GET`-by-id,
+  `POST`, `PUT`) is now a bare object, not `{"keyword": {...}}`. The `PUT`
+  sends the whole keyword:
+  its `keyworddata` array replaces what's stored, so a deleted row is
+  expressed by its absence, and rows carry `keyworddataid` only when they
+  already exist.
 
   **`keywordorder` is always present and is `null` when the row has no
   explicit order** — the key is never omitted, so the server never has to
@@ -500,16 +586,20 @@ are now implemented (with some deliberate gaps noted below). See the
   type). On the read side the client accepts `null`, an absent key, or an
   empty string as "no order", and coerces a numeric string to a number.
 
-  What the server must *reply*: only the `POST` response is parsed. It has to
-  be JSON (an empty 200 fails), either `{"keyword": {...}}` or the bare
-  object, carrying a `keywordid` — a number, or a numeric string, since an id
-  serialised from a Java long often arrives quoted. Nothing else in it is
-  required: the editor re-reads the app immediately afterwards, so
-  `{"keywordid": 412}` is enough. `PUT` and `DELETE` responses are never read
-  — any 2xx is success, an empty body is fine, and a non-2xx surfaces its
-  status plus the first 500 characters of its body. When a `POST` reply can't
-  be used, the error quotes the first 300 characters of what actually came
-  back, since a 200 with the wrong shape isn't otherwise logged.
+  What the client actually *parses*: only the `POST` response, via
+  `unwrapKeyword()` (also used by `fetchKeyword()`, the client's
+  `GET`-by-id method) — it takes the bare object the server now sends, and
+  still falls back to unwrapping `{"keyword": {...}}` as tolerance for the
+  wrapped shape create responses used before the contract settled on bare. It
+  has to be JSON (an empty 200 fails), carrying a `keywordid` — a number, or
+  a numeric string, since an id serialised from a Java long often arrives
+  quoted. Nothing else in it is required: the editor re-reads the app
+  immediately afterwards, so `{"keywordid": 412}` is enough. `PUT` and
+  `DELETE` responses are never read by this client — any 2xx is success, an
+  empty body is fine, and a non-2xx surfaces its status plus the first 500
+  characters of its body. When a `POST` reply can't be used, the error quotes
+  the first 300 characters of what actually came back, since a 200 with the
+  wrong shape isn't otherwise logged.
 
   The keyword array is located in the app pull by `extractKeywords()` — by
   shape (objects with `name` and `keyworddata`, which `designelements` can't
@@ -523,9 +613,9 @@ are now implemented (with some deliberate gaps noted below). See the
 
   Note that the app pull carries every design element's base64 content, so
   opening the editor (and each reload after a save) is a heavy request for a
-  small amount of data. If that ever bites on a large application, a
-  lightweight `GET /vortex/{appid}/keywords` is the fix — `fetchKeywords()` is
-  the only place that would change.
+  small amount of data. If that ever bites on a large application, switching
+  `fetchKeywords()` to the lightweight `GET /vortex/{appid}/keywords` above is
+  the fix — it's the only place that would change.
 
 - **Compiling and uploading Java** (`javaCompiler.ts`): `Tornado: Compile &
   Upload Java` batch-compiles all `.java` files under a synced app's

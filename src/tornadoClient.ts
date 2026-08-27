@@ -117,16 +117,61 @@ export function extractKeywords(body: unknown): Keyword[] | undefined {
   return extractArray<Keyword>(body, (first) => "name" in first && "keyworddata" in first, /keyword/i);
 }
 
+// A column (ATTRIBUTE) of a table (PMATABLE). Every flag field is the
+// string "1"/"0", never a JSON boolean, and typesize is always a string too
+// — it can be a compound value like "6,2" for NUMERIC precision, so it must
+// never be parsed as an int.
+export interface Column {
+  attributeid: number;
+  tableid: number;
+  attributename: string;
+  type: string;
+  typesize: string;
+  allownull: string;
+  isprimarykey: string;
+  reftable: string;
+  extraoptions: string;
+  cascadedelete: string;
+  autoincrement: string;
+  isunique: string;
+  ftindex: string;
+  description: string;
+}
+
+// attributeid/tableid don't exist yet — the POST body when creating a
+// column, the same way NewKeywordPayload works for keywords.
+export type NewColumnPayload = Omit<Column, "attributeid" | "tableid">;
+
+// A table (PMATABLE) of a data connection, with its columns embedded.
+export interface Table {
+  tableid: number;
+  dbconnectionid: number;
+  tablename: string;
+  buildorder: number;
+  description: string;
+  columns: Column[];
+}
+
+export type NewTablePayload = Pick<Table, "tablename" | "buildorder" | "description">;
+
+// The subset of a data connection's own fields the PUT endpoint accepts —
+// dburl/dbdriver/dbusername/dbpassword/dburloptions/options/inheritfrom are
+// never exposed by GET and cannot be set through this API.
+export type DataConnectionUpdatePayload = Pick<DataConnection, "connectionname" | "databasename" | "comment">;
+
 // A named server-side JDBC data source (DATACONNECTION), carried alongside
 // a specific app's design pull (not the top-level /vortex inventory) purely
 // as reference metadata — Vortex2 never opens or queries it. "schema" is the
 // raw auto-generated DDL dump the server logs for it, including any
-// connection error it hit while generating it.
+// connection error it hit while generating it. tables arrives nested here
+// the same way it does from GET /vortex/{appid}/database/{dbid}.
 export interface DataConnection {
+  dbconnectionid: number;
   connectionname: string;
   databasename: string;
   schema: string;
   comment: string;
+  tables: Table[];
 }
 
 export function extractDataConnections(body: unknown): DataConnection[] | undefined {
@@ -137,8 +182,18 @@ export function extractDataConnections(body: unknown): DataConnection[] | undefi
   );
 }
 
-// A single keyword from a create response: the wrapped {"keyword": {...}} the
-// PUT/POST bodies use, or the bare object. Exported for testability.
+// Request bodies for the database API stay wrapped under these keys, the
+// same convention KEYWORD_KEY follows — but every response that carries a
+// single database/table/column object is bare, never wrapped.
+export const DATABASE_KEY = "database";
+export const TABLE_KEY = "table";
+export const COLUMN_KEY = "column";
+
+// A single keyword from a GET-by-id, POST, or PUT response. The server sends
+// a bare object for all three; the {"keyword": {...}} branch is leftover
+// tolerance for the wrapped shape create responses used before the contract
+// settled on bare — request bodies still send that wrapper regardless (see
+// KEYWORD_KEY). Exported for testability.
 export function unwrapKeyword(body: unknown): Keyword | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return undefined;
@@ -172,9 +227,11 @@ export interface DesignElement {
 
 export interface ApplicationDesign {
   designelements: DesignElement[];
-  // Keywords ride along in the same app pull as the design elements — there's
-  // no separate read endpoint for them. Empty when the response carries no
-  // keyword array at all, which is not an error: an app can simply have none.
+  // Keywords ride along in the same app pull as the design elements. A
+  // lightweight GET /vortex/{appid}/keywords also exists (see fetchKeywords()
+  // below and the README), but this design pull remains the source used for
+  // the keyword editor. Empty when the response carries no keyword array at
+  // all, which is not an error: an app can simply have none.
   keywords: Keyword[];
   // Data connections ride along the same way — the full /vortex inventory
   // does NOT carry them; they only show up once a specific app is opened.
@@ -450,18 +507,38 @@ export class TornadoClient {
   }
 
   // An application's keywords (KEYWORD), each carrying its own value list
-  // (KEYWORDDATA) inline. There is no keyword *read* endpoint: they come down
-  // in the same app pull as the design elements, so this reuses that. Writes
-  // do have their own endpoints (below) — a rename and its row edits save
-  // together in one PUT rather than as two calls that can half-fail.
+  // (KEYWORDDATA) inline. A lightweight GET /vortex/{appid}/keywords exists
+  // (wrapped {"keywords": [...]}, same shape as this always used) but this
+  // still reuses the app pull instead, since that's what the keyword editor
+  // was built against. Writes do have their own endpoints (below) — a rename
+  // and its row edits save together in one PUT rather than as two calls that
+  // can half-fail.
   //
   // Worth knowing: that app pull carries every design element's base64
   // content, so this is a heavy request for a small amount of data. If
   // reopening or saving in the keyword editor ever feels slow on a large
-  // application, a lightweight GET /vortex/{appid}/keywords is the fix.
+  // application, switching this to GET /vortex/{appid}/keywords is the fix.
   async fetchKeywords(appid: number): Promise<Keyword[]> {
     const design = await this.fetchApplicationDesign(appid);
     return design.keywords;
+  }
+
+  // A single keyword by id — GET /vortex/{appid}/keywords/{kwid}, returning
+  // the bare object (see unwrapKeyword()). Not currently called anywhere in
+  // this extension — the keyword editor always reloads the full list via
+  // fetchKeywords().
+  async fetchKeyword(appid: number, keywordid: number): Promise<Keyword> {
+    const response = await this.request(`/vortex/${appid}/keywords/${keywordid}`);
+    const body = (await response.json()) as unknown;
+    const keyword = unwrapKeyword(body);
+    if (!keyword) {
+      const keys = body && typeof body === "object" ? Object.keys(body as object).join(", ") : typeof body;
+      throw new Error(
+        `Expected a keyword object for app ${appid}, keyword ${keywordid}, but got: ${keys}. ` +
+          "The response shape assumption may be wrong — check the Tornado output channel for the raw response.",
+      );
+    }
+    return keyword;
   }
 
   // Fails loudly if the response omits the new keywordid, rather than leaving
@@ -512,6 +589,156 @@ export class TornadoClient {
 
   async deleteKeyword(appid: number, keywordid: number): Promise<void> {
     await this.request(`/vortex/${appid}/keywords/${keywordid}`, { method: "DELETE" });
+  }
+
+  // The lightweight list — same wrapped-list shape as the dataconnections
+  // array already carried in fetchApplicationDesign(). Not currently called
+  // anywhere in this extension, which reads its baseline from the app pull.
+  async fetchDataConnections(appid: number): Promise<DataConnection[]> {
+    const response = await this.request(`/vortex/${appid}/database`);
+    const body = (await response.json()) as unknown;
+    const dataconnections = extractDataConnections(body);
+    if (!dataconnections) {
+      const keys = body && typeof body === "object" ? Object.keys(body as object).join(", ") : typeof body;
+      throw new Error(
+        `Expected a "dataconnections" array in the response for app ${appid}, but got: ${keys}.`,
+      );
+    }
+    return dataconnections;
+  }
+
+  // A single data connection by id, with its tables/columns embedded. Not
+  // currently called anywhere in this extension.
+  async fetchDataConnection(appid: number, dbid: number): Promise<DataConnection> {
+    const response = await this.request(`/vortex/${appid}/database/${dbid}`);
+    return (await response.json()) as DataConnection;
+  }
+
+  // Only connectionname/databasename/comment are settable — see
+  // DataConnectionUpdatePayload. The refreshed object the server replies
+  // with is never read: every caller already has the values it just sent.
+  async updateDataConnection(
+    appid: number,
+    dbid: number,
+    payload: DataConnectionUpdatePayload,
+  ): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [DATABASE_KEY]: payload }),
+    });
+  }
+
+  // Cascades server-side: every column of every table under this connection,
+  // then every table, then the connection itself.
+  async deleteDataConnection(appid: number, dbid: number): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}`, { method: "DELETE" });
+  }
+
+  // Not currently called anywhere in this extension — tables are only ever
+  // read nested inside a DataConnection from the app pull.
+  async fetchTable(appid: number, dbid: number, tableid: number): Promise<Table> {
+    const response = await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}`);
+    return (await response.json()) as Table;
+  }
+
+  // Fails loudly if the response omits the new tableid, rather than leaving
+  // the caller holding a table it can't address for its column creates —
+  // same guard as createKeyword/createDesignElement.
+  async createTable(appid: number, dbid: number, payload: NewTablePayload): Promise<Table> {
+    const response = await this.request(`/vortex/${appid}/database/${dbid}/table`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [TABLE_KEY]: payload }),
+    });
+    const raw = await response.text();
+    let created: unknown;
+    try {
+      created = JSON.parse(raw);
+    } catch {
+      throw new Error(
+        `Tornado server's create-table response was not JSON. It replied ${response.status} with: ` +
+          `${raw.slice(0, 300) || "(an empty body)"}`,
+      );
+    }
+    const table = created as Partial<Table>;
+    if (typeof table.tableid !== "number") {
+      throw new Error(
+        "Tornado server's create-table response did not include a numeric tableid — cannot address " +
+          `this table for its columns. It replied ${response.status} with: ${raw.slice(0, 300)}`,
+      );
+    }
+    return table as Table;
+  }
+
+  // The updated object the server replies with is never read — see
+  // updateDataConnection.
+  async updateTable(appid: number, dbid: number, tableid: number, payload: NewTablePayload): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [TABLE_KEY]: payload }),
+    });
+  }
+
+  // Cascades server-side: every column of this table, then the table itself.
+  async deleteTable(appid: number, dbid: number, tableid: number): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}`, { method: "DELETE" });
+  }
+
+  // Same fail-loudly guard as createTable — the caller needs the new
+  // attributeid to address this column for later edits.
+  async createColumn(
+    appid: number,
+    dbid: number,
+    tableid: number,
+    payload: NewColumnPayload,
+  ): Promise<Column> {
+    const response = await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}/column/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [COLUMN_KEY]: payload }),
+    });
+    const raw = await response.text();
+    let created: unknown;
+    try {
+      created = JSON.parse(raw);
+    } catch {
+      throw new Error(
+        `Tornado server's create-column response was not JSON. It replied ${response.status} with: ` +
+          `${raw.slice(0, 300) || "(an empty body)"}`,
+      );
+    }
+    const column = created as Partial<Column>;
+    if (typeof column.attributeid !== "number") {
+      throw new Error(
+        "Tornado server's create-column response did not include a numeric attributeid — cannot " +
+          `address this column for later edits. It replied ${response.status} with: ${raw.slice(0, 300)}`,
+      );
+    }
+    return column as Column;
+  }
+
+  // The updated object the server replies with is never read — see
+  // updateDataConnection.
+  async updateColumn(
+    appid: number,
+    dbid: number,
+    tableid: number,
+    attributeid: number,
+    payload: NewColumnPayload,
+  ): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}/column/${attributeid}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [COLUMN_KEY]: payload }),
+    });
+  }
+
+  async deleteColumn(appid: number, dbid: number, tableid: number, attributeid: number): Promise<void> {
+    await this.request(`/vortex/${appid}/database/${dbid}/table/${tableid}/column/${attributeid}`, {
+      method: "DELETE",
+    });
   }
 
   // Response shape (full created element, incl. new designbucketid) is

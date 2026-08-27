@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.18
+
+- Added: data connections, tables, and columns can now be edited by hand
+  through `.tornado-manifest.json`'s new `"dataconnections"` section —
+  renaming a connection/table/column or adding a new table/column is pushed
+  to the server (`GET`/`PUT /vortex/{appid}/database/{dbid}`, and the new
+  table/column `POST`/`PUT`/`DELETE` endpoints) the same way `appparams`/
+  `designparams` edits already are. Removing an entry is confirmed with a
+  modal before the corresponding (cascading) `DELETE` runs, rather than
+  pushed silently. `DataConnections/{connectionname}.sql` stays a read-only
+  reference dump; editing it directly does nothing.
+
+## 0.0.17
+
+- Changed: updated the keyword API contract to match the server's now-real
+  implementation — `GET /vortex/{appid}/keywords/{kwid}` and the `POST`/`PUT`
+  responses for a keyword are bare objects rather than `{"keyword": {...}}`.
+  Added `TornadoClient.fetchKeyword()` for the by-id endpoint (not yet called
+  from the keyword editor, which still reloads the full list).
+
 ## 0.0.16
 
 - Fixed: an app synced before `java.project.sourcePaths` wiring existed (or

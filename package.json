@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.16",
+  "version": "0.0.18",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -18,6 +18,7 @@
   ],
   "icon": "media/icon.png",
   "main": "./dist/extension.js",
+  "activationEvents": [],
   "contributes": {
     "commands": [
       {
@@ -164,7 +165,7 @@
         "tornado.pushLocalParameterEdits": {
           "type": "boolean",
           "default": true,
-          "description": "When a watched application's .tornado-manifest.json is edited directly on disk (e.g. by an external tool or an AI coding agent), push the resulting designparams/appparams changes to the Tornado server the same way the interactive parameter-editing commands do. Disable to hand-edit the manifest offline without triggering a live push."
+          "description": "When a watched application's .tornado-manifest.json is edited directly on disk (e.g. by an external tool or an AI coding agent), push the resulting designparams/appparams/dataconnections changes to the Tornado server the same way the interactive editing commands do (a dataconnections edit that deletes a table, column, or connection is still confirmed before anything is actually deleted). Disable to hand-edit the manifest offline without triggering a live push."
         }
       }
     },

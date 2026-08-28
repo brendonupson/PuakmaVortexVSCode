@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.21
+
+- Fixed: a brand-new `.java` file under `Actions/`, `SharedCode/`, or
+  `ScheduledActions/` (e.g. created by hand or by an AI coding agent) never
+  got a design element created for it — `Tornado: Compile & Upload Java`
+  and auto-compile-on-save only ever updated an *existing* manifest entry
+  matched by class name, so an unmatched compiled class was logged as
+  "no matching Java design element in the manifest" and skipped forever.
+  It's now created on the server the first time it compiles, the same way
+  nested/inner classes already were, and added to the manifest so the next
+  compile updates it in place.
+
 ## 0.0.20
 
 - Fixed: the 0.0.19 fix only covered the manifest — the same atomic-write

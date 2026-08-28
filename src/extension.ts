@@ -35,6 +35,7 @@ import {
   designTypeFolder,
   ensureDevConfig,
   fileNameFor,
+  folderToDesignType,
   inferContentType,
   isNestedJavaClassName,
   readManifest,
@@ -320,14 +321,66 @@ async function compileAndUploadFolder(
     const className = fileName.replace(/\.class$/, "");
     // Java-source design types only (Actions/SharedCode/ScheduledActions
     // — designtypes 3/4/6); matched by name, same as the reference tool.
+    const classBytes = await vscode.workspace.fs.readFile(classFileUri);
     const entry = manifest.elements.find((e) => e.name === className && [3, 4, 6].includes(e.designtype));
     if (!entry) {
-      output.appendLine(`Skipping ${fileName}: no matching Java design element in the manifest.`);
-      skipped++;
+      // No manifest entry yet — either a brand-new .java source (e.g. added
+      // by hand or by an AI coding agent, never registered as a design
+      // element) or one whose name doesn't match anything tracked. Find its
+      // source among this batch by class name, create it on the server (the
+      // way handleCreate() does for every other design type), and add it to
+      // the manifest so future compiles update it in place instead of
+      // hitting this branch again.
+      const sourceFsPath = result.sourceFiles.find((file) => path.basename(file, ".java") === className);
+      if (!sourceFsPath) {
+        output.appendLine(`Skipping ${fileName}: no matching Java design element in the manifest.`);
+        skipped++;
+        continue;
+      }
+      const sourceFolder = path.basename(path.dirname(sourceFsPath));
+      const designtype = folderToDesignType(sourceFolder);
+      if (designtype === undefined) {
+        output.appendLine(`Skipping ${fileName}: unrecognised design type folder "${sourceFolder}".`);
+        skipped++;
+        continue;
+      }
+      const sourceBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(sourceFsPath));
+      const sourceBase64 = Buffer.from(sourceBytes).toString("base64");
+      const hash = hashUpload(classBytes, sourceBytes);
+      const contenttype = inferContentType(designtype, ".java");
+      const newPayload: NewDesignElementPayload = {
+        appid: manifest.appid,
+        name: className,
+        designtype,
+        contenttype,
+        designdata: Buffer.from(classBytes).toString("base64"),
+        designsource: sourceBase64,
+        inheritfrom: null,
+        comment: "",
+        options: "",
+        designparams: [],
+      };
+      const created = await client.createDesignElement(manifest.appid, newPayload);
+      manifest.elements.push({
+        path: `${sourceFolder}/${created.name}.java`,
+        designbucketid: created.designbucketid,
+        name: created.name,
+        designtype: created.designtype,
+        contenttype: created.contenttype,
+        inheritfrom: created.inheritfrom,
+        comment: created.comment,
+        options: created.options,
+        designparams: created.designparams,
+        uploadedHash: hash,
+      });
+      manifestChanged = true;
+      output.appendLine(
+        `Created "${className}" as a new ${sourceFolder} design element (id ${created.designbucketid}).`,
+      );
+      uploaded++;
       continue;
     }
 
-    const classBytes = await vscode.workspace.fs.readFile(classFileUri);
     let sourceBytes: Uint8Array = new Uint8Array(0);
     let sourceBase64 = "";
     try {

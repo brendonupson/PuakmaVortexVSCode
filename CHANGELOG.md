@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.0.22
+
+- Added: 0.0.21 made Java sources self-heal on every compile — an unmatched
+  `.java` gets a design element created for it automatically. Every other
+  design type (Pages, Resources, Documentation, Widgets, and non-Java files
+  in Actions/SharedCode/ScheduledActions) had no equivalent: only a live
+  file-creation event while the app was already being watched ever created
+  one, so a file added while VS Code was closed, before the app was opened,
+  or dropped during a suppressed bulk write, was orphaned forever. Watching
+  an app (opening it, syncing it, or running "Tornado: Start Watching") now
+  scans its design-type folders for local files missing from
+  `.tornado-manifest.json` and — if any are found — shows a confirmation
+  modal listing them before creating them on the server. Confirmed rather
+  than silent: a file left over after deliberately deleting its design
+  element on the server and choosing "merge" when reopening the app looks
+  identical to a genuinely new one, and this must not recreate it unasked.
+  Declining leaves the files untracked; the modal reappears next time the
+  app is watched.
+
 ## 0.0.21
 
 - Fixed: a brand-new `.java` file under `Actions/`, `SharedCode/`, or

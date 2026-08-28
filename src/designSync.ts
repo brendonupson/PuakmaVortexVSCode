@@ -34,6 +34,10 @@ export function designTypeFolder(designtype: number): string | undefined {
   return DESIGN_TYPE_FOLDERS[designtype];
 }
 
+// Every recognised design-type folder, for callers that need to walk all of
+// them (e.g. AppWatcher.reconcileUntracked()) rather than map a single one.
+export const DESIGN_TYPE_FOLDER_NAMES: readonly string[] = Object.values(DESIGN_TYPE_FOLDERS);
+
 // Design types whose elements have no editable parameters. The context-menu
 // "when" clause for tornado.editDesignElementParameters in package.json
 // spells out the *folders* of the types that do (Pages, Resources, Actions),

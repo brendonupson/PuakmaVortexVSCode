@@ -8,6 +8,7 @@ import {
 } from "./tornadoClient";
 import {
   AGENT_INSTRUCTION_FILENAMES,
+  DESIGN_TYPE_FOLDER_NAMES,
   DEV_CONFIG_RELATIVE_PATH,
   Manifest,
   ManifestColumn,
@@ -103,6 +104,96 @@ export class AppWatcher implements vscode.Disposable {
       vscode.Uri.joinPath(this.appFolder, MANIFEST_FILENAME),
     );
     this.manifest = JSON.parse(Buffer.from(bytes).toString("utf-8")) as Manifest;
+  }
+
+  // Java sources self-heal on every compile (compileAndUploadFolder in
+  // extension.ts creates a design element for any unmatched class), but
+  // nothing else in the extension ever revisits a local file that already
+  // exists when the watcher attaches — only a live onDidCreate event creates
+  // one. A file added while this app wasn't being watched (VS Code closed,
+  // the app not yet opened, or dropped during a runSuppressed() window whose
+  // create event dispatch() then silently discarded) is otherwise orphaned
+  // forever. Called once after (re)attaching a watcher — see
+  // startWatchingFolder() in extension.ts — to close that gap the same way
+  // for every design type: walk each design-type folder and, for anything
+  // untracked, confirm before handing it to handleCreate() (which already
+  // knows how to create it). Confirmed rather than silent — unlike a file
+  // created while this app was already being watched, a file sitting here
+  // at attach time might just as well be one deliberately deleted on the
+  // server and kept locally (see confirmAndResetAppFolder's "merge" choice)
+  // — indistinguishable from a genuinely new file, and creating it back
+  // unasked would resurrect a real deletion.
+  async reconcileUntracked(): Promise<void> {
+    const candidates: { folderName: string; name: string; relativePath: string }[] = [];
+    for (const folderName of DESIGN_TYPE_FOLDER_NAMES) {
+      const dirUri = vscode.Uri.joinPath(this.appFolder, folderName);
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(dirUri);
+      } catch {
+        continue;
+      }
+      for (const [name, type] of entries) {
+        const relativePath = `${folderName}/${name}`;
+        // Hidden/OS/editor housekeeping files (.DS_Store, .swp, ...) are not
+        // design elements — and for a bare-name design type (Pages, Actions,
+        // SharedCode, ScheduledActions) a leading-dot name has no
+        // non-extension part at all, which would create one with an empty
+        // server name.
+        if (
+          type !== vscode.FileType.File ||
+          name.startsWith(".") ||
+          relativePath === DEV_CONFIG_RELATIVE_PATH ||
+          this.findEntry(relativePath)
+        ) {
+          continue;
+        }
+        const dot = name.lastIndexOf(".");
+        const ext = dot >= 0 ? name.slice(dot) : "";
+        // folderName always maps to a designtype — it came from
+        // DESIGN_TYPE_FOLDER_NAMES, folderToDesignType()'s own domain.
+        const designtype = folderToDesignType(folderName) as number;
+        if (isJavaSourceUpload(designtype, ext)) {
+          // Left for the next compile to pick up (see compileAndUploadFolder)
+          // rather than listed here as if this sweep would create it.
+          continue;
+        }
+        candidates.push({ folderName, name, relativePath });
+      }
+    }
+    if (candidates.length === 0) {
+      return;
+    }
+
+    const confirmAction = "Create on Server";
+    const list = candidates.map((c) => `- ${c.relativePath}`).join("\n");
+    const confirmed = await vscode.window.showWarningMessage(
+      `${candidates.length} local file(s) in this app aren't in ${MANIFEST_FILENAME} — create them as new design ` +
+        `elements on the Tornado server? If any of these were deliberately deleted on the server and kept locally, ` +
+        `choose "Cancel" and remove them by hand instead.\n\n${list}`,
+      { modal: true },
+      confirmAction,
+    );
+    if (confirmed !== confirmAction) {
+      this.output.appendLine(
+        `Kept ${candidates.length} untracked local file(s) unpushed (not created on the server): ` +
+          candidates.map((c) => c.relativePath).join(", "),
+      );
+      return;
+    }
+
+    // Runs handleCreate() directly rather than through a live fs event, but
+    // handleCreate() still ends every create in persistManifest() (a real
+    // write to .tornado-manifest.json), and this watcher is already
+    // attached and listening by the time this runs — without suppressing,
+    // that write's own onDidChange would race handleManifestChange() against
+    // this loop's next handleCreate() over the same this.manifest object.
+    await this.runSuppressed(async () => {
+      for (const candidate of candidates) {
+        const uri = vscode.Uri.joinPath(this.appFolder, candidate.folderName, candidate.name);
+        await this.handleCreate(uri);
+      }
+    });
   }
 
   private dispatch(fn: () => Promise<void>): void {

@@ -114,6 +114,9 @@ async function startWatchingFolder(
   context.subscriptions.push(watcher, {
     dispose: () => activeWatchers.delete(key),
   });
+  // Picks up anything created on disk while this app wasn't being watched —
+  // see the comment on reconcileUntracked() itself.
+  await watcher.reconcileUntracked();
   return watcher;
 }
 

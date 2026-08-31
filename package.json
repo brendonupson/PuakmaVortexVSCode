@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.22",
+  "version": "0.0.23",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -160,7 +160,7 @@
         "tornado.compileOnSave": {
           "type": "boolean",
           "default": true,
-          "description": "When a watched application's .java file (Actions/SharedCode/ScheduledActions) is saved, automatically compile the whole application's Java and upload the resulting classes. Disable if this feels too eager (e.g. compiling on every save while iterating)."
+          "description": "When a watched application's .java file (Actions/SharedCode/ScheduledActions) changes — saved in the editor, written directly on disk (e.g. by an AI coding agent), or found newer than its compiled class when the app starts being watched — automatically compile the whole application's Java and upload the resulting classes. Disable if this feels too eager (e.g. compiling on every save while iterating)."
         },
         "tornado.pushLocalParameterEdits": {
           "type": "boolean",

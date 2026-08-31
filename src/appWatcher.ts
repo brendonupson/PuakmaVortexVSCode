@@ -27,6 +27,7 @@ import {
   useSourceField,
   writeManifestFile,
 } from "./designSync";
+import { JAVA_SOURCE_FOLDERS, isJavaSourceStale } from "./javaCompiler";
 import { logError } from "./logging";
 
 // A change under here should be made through .tornado-manifest.json's
@@ -71,6 +72,11 @@ export class AppWatcher implements vscode.Disposable {
     private readonly client: TornadoClient,
     private readonly output: vscode.OutputChannel,
     private manifest: Manifest,
+    // Debounces and runs compileAndUploadFolder — defined in extension.ts,
+    // which owns the state (compileStatus, javaDiagnostics) a compile needs
+    // and that this class has no reason to hold. Fire-and-forget: scheduling
+    // is synchronous, the compile itself runs and logs on its own.
+    private readonly scheduleJavaCompile: (relativePath: string) => void,
   ) {
     const pattern = new vscode.RelativePattern(appFolder, "**/*");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
@@ -196,6 +202,39 @@ export class AppWatcher implements vscode.Disposable {
     });
   }
 
+  // A live edit to an existing .java file gets a direct signal — the
+  // onDidChange/onDidCreate event itself, handled by
+  // triggerJavaCompileOrExplain() below — but an edit made while this app
+  // wasn't being watched at all fires nothing. Called once alongside
+  // reconcileUntracked() when a watcher (re)attaches: compares every source's
+  // mtime against its compiled output (see isJavaSourceStale) and schedules
+  // one compile if anything needs it — a single compile catches every stale
+  // source at once, so there's no reason to schedule per file.
+  async checkJavaFreshness(): Promise<void> {
+    if (!vscode.workspace.getConfiguration("tornado").get<boolean>("compileOnSave", true)) {
+      return;
+    }
+    for (const folderName of JAVA_SOURCE_FOLDERS) {
+      const dirUri = vscode.Uri.joinPath(this.appFolder, folderName);
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(dirUri);
+      } catch {
+        continue;
+      }
+      for (const [name, type] of entries) {
+        if (type !== vscode.FileType.File || !name.endsWith(".java")) {
+          continue;
+        }
+        const relativePath = `${folderName}/${name}`;
+        if (await isJavaSourceStale(this.appFolder, relativePath)) {
+          this.scheduleJavaCompile(relativePath);
+          return;
+        }
+      }
+    }
+  }
+
   private dispatch(fn: () => Promise<void>): void {
     if (this.suppressed) {
       return;
@@ -217,6 +256,24 @@ export class AppWatcher implements vscode.Disposable {
 
   private async persistManifest(): Promise<void> {
     await writeManifestFile(this.appFolder, this.manifest);
+  }
+
+  // isJavaSourceUpload() also matches ".class" (a compiled artifact changing
+  // on disk isn't something to compile from) and the compileOnSave setting
+  // can be off — both cases fall back to the old message pointing at the
+  // manual command, which the compile itself also respects and would
+  // otherwise silently ignore.
+  private triggerJavaCompileOrExplain(relativePath: string, ext: string): void {
+    const compileOnSave = vscode.workspace.getConfiguration("tornado").get<boolean>("compileOnSave", true);
+    if (ext === ".java" && compileOnSave) {
+      this.output.appendLine(`"${relativePath}" changed — scheduling a compile.`);
+      this.scheduleJavaCompile(relativePath);
+      return;
+    }
+    this.output.appendLine(
+      `Skipped "${relativePath}": Java source/class changes aren't uploaded by the watcher — ` +
+        'run "Tornado: Compile & Upload Java" to compile and upload it.',
+    );
   }
 
   // Queues onto manifestChangeQueue rather than calling handleManifestChange()
@@ -290,10 +347,7 @@ export class AppWatcher implements vscode.Disposable {
     const baseName = dot >= 0 ? fileName.slice(0, dot) : fileName;
 
     if (isJavaSourceUpload(designtype, ext)) {
-      this.output.appendLine(
-        `Skipped "${relativePath}": Java source/class changes aren't uploaded by the watcher — ` +
-          'run "Tornado: Compile & Upload Java" to compile and upload it.',
-      );
+      this.triggerJavaCompileOrExplain(relativePath, ext);
       return;
     }
 
@@ -354,10 +408,7 @@ export class AppWatcher implements vscode.Disposable {
     const dot = relativePath.lastIndexOf(".");
     const ext = dot >= 0 ? relativePath.slice(dot) : "";
     if (isJavaSourceUpload(entry.designtype, ext)) {
-      this.output.appendLine(
-        `Skipped "${relativePath}": Java source/class changes aren't uploaded by the watcher — ` +
-          'run "Tornado: Compile & Upload Java" to compile and upload it.',
-      );
+      this.triggerJavaCompileOrExplain(relativePath, ext);
       return;
     }
 

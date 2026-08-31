@@ -48,7 +48,13 @@ import {
 import { AppWatcher } from "./appWatcher";
 import { openKeywordEditor } from "./keywordEditor";
 import { createOutputChannel, logError, traceCommand } from "./logging";
-import { CompileDiagnostic, compileApp, ensureServerLibraries, SERVER_LIB_FOLDER } from "./javaCompiler";
+import {
+  CompileDiagnostic,
+  JAVA_SOURCE_FOLDERS,
+  compileApp,
+  ensureServerLibraries,
+  SERVER_LIB_FOLDER,
+} from "./javaCompiler";
 import { ensureJavaIntelliSense, removeJavaIntelliSense } from "./javaIntellisense";
 import { JavaCompileStatusProvider } from "./javaCompileStatus";
 
@@ -97,6 +103,7 @@ async function startWatchingFolder(
   output: vscode.OutputChannel,
   activeWatchers: Map<string, AppWatcher>,
   appFolder: vscode.Uri,
+  scheduleAutoCompile: (folder: vscode.Uri, changedRelativePath: string) => void,
 ): Promise<AppWatcher> {
   const key = appFolder.toString();
   const existing = activeWatchers.get(key);
@@ -109,14 +116,18 @@ async function startWatchingFolder(
     throw new Error(`No synced application found at ${appFolder.fsPath} — sync it first.`);
   }
   const { client } = await buildClientForConnection(context, output, manifest.connectionId);
-  const watcher = new AppWatcher(appFolder, manifest.appid, client, output, manifest);
+  const watcher = new AppWatcher(appFolder, manifest.appid, client, output, manifest, (relativePath) =>
+    scheduleAutoCompile(appFolder, relativePath),
+  );
   activeWatchers.set(key, watcher);
   context.subscriptions.push(watcher, {
     dispose: () => activeWatchers.delete(key),
   });
-  // Picks up anything created on disk while this app wasn't being watched —
-  // see the comment on reconcileUntracked() itself.
+  // Picks up anything created on disk, or any .java source edited, while
+  // this app wasn't being watched — see the comments on reconcileUntracked()
+  // and checkJavaFreshness() themselves.
   await watcher.reconcileUntracked();
+  await watcher.checkJavaFreshness();
   return watcher;
 }
 
@@ -1127,6 +1138,72 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const javaDiagnostics = vscode.languages.createDiagnosticCollection("tornado-java");
   context.subscriptions.push(javaDiagnostics);
 
+  // Auto-compile: a .java source changing always recompiles and re-uploads
+  // the *whole* app's Java, not just the one file — Actions, SharedCode, and
+  // ScheduledActions can reference each other, so compiling one file in
+  // isolation could fail (or silently miss cross-file changes) in a way a
+  // single-file compile can't detect. Only fires for apps that are currently
+  // watched, matching how every other file type already only auto-uploads
+  // while watching. Debounced per app folder so several files changing in
+  // quick succession (e.g. Save All, or an AI coding agent editing more than
+  // one source) triggers one compile, not one per file; a still-running
+  // compile for that folder is skipped rather than overlapped with a second
+  // javac invocation into the same zbin/. Shared by the onDidSaveTextDocument
+  // listener below (an in-editor save) and AppWatcher (a direct on-disk
+  // write, which never fires onDidSaveTextDocument at all) — both routes to
+  // "a .java source changed" end up here.
+  const compileDebounce = new Map<string, ReturnType<typeof setTimeout>>();
+  const compilingFolders = new Set<string>();
+
+  async function runAutoCompile(folder: vscode.Uri, changedRelativePath: string): Promise<void> {
+    const key = folder.toString();
+    if (compilingFolders.has(key)) {
+      output.appendLine(`Skipped auto-compile for ${folder.fsPath}: a compile is already in progress.`);
+      return;
+    }
+    compilingFolders.add(key);
+    output.appendLine(`Auto-compiling ${folder.fsPath} after "${changedRelativePath}" changed...`);
+    try {
+      const result = await compileAndUploadFolder(context, output, folder, compileStatus, javaDiagnostics);
+      if (result) {
+        output.appendLine(`Auto-compile: ${formatCompileSummary(result)}.`);
+        // Only pop a toast for sources that produced no output at all —
+        // ecj reporting errors but still uploading a stub (the common
+        // case now, see formatCompileSummary) is routine with
+        // -proceedOnError and would make every save with a lingering
+        // error noisy, defeating the point of "keep working despite
+        // errors".
+        if (result.failedSourceNames.length > 0) {
+          vscode.window.showWarningMessage(
+            `Tornado auto-compile: ${result.uploaded} uploaded, but ` +
+              `${result.failedSourceNames.join(", ")} produced no output at all — see the Tornado output channel.`,
+          );
+        }
+      }
+    } catch (error) {
+      logError(output, `Auto-compile failed: ${(error as Error).message}`);
+      output.show(true);
+      vscode.window.showErrorMessage(`Tornado auto-compile failed: ${(error as Error).message}`);
+    } finally {
+      compilingFolders.delete(key);
+    }
+  }
+
+  function scheduleAutoCompile(folder: vscode.Uri, changedRelativePath: string): void {
+    const key = folder.toString();
+    const existingTimer = compileDebounce.get(key);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    compileDebounce.set(
+      key,
+      setTimeout(() => {
+        compileDebounce.delete(key);
+        void runAutoCompile(folder, changedRelativePath);
+      }, 400),
+    );
+  }
+
   const treeProvider = new InventoryTreeProvider(undefined, output);
   const treeView = vscode.window.createTreeView("tornadoInventory", {
     treeDataProvider: treeProvider,
@@ -1470,7 +1547,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // Only ever stopped by the reset path; restart it so "opening"
             // an app that was being watched doesn't quietly stop watching it.
             if (!activeWatchers.has(folder.toString())) {
-              await startWatchingFolder(context, output, activeWatchers, folder);
+              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
               output.appendLine(`Resumed watching ${folder.fsPath}.`);
             }
             vscode.window.showInformationMessage(
@@ -1483,7 +1560,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               startWatchingAction,
             );
             if (choice === startWatchingAction) {
-              await startWatchingFolder(context, output, activeWatchers, folder);
+              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
               vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
             }
           }
@@ -1587,7 +1664,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           startWatchingAction,
         );
         if (choice === startWatchingAction) {
-          await startWatchingFolder(context, output, activeWatchers, folder);
+          await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
           vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
         }
       } catch (error) {
@@ -1609,7 +1686,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       try {
-        await startWatchingFolder(context, output, activeWatchers, folder);
+        await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
         vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
       } catch (error) {
         vscode.window.showErrorMessage(`Failed to start watching: ${(error as Error).message}`);
@@ -2134,7 +2211,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const renamed = await vscode.workspace.applyEdit(renameEdit);
             if (!renamed) {
               if (wasWatching) {
-                await startWatchingFolder(context, output, activeWatchers, folder);
+                await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
               }
               throw new Error(
                 `Renamed "${oldAppName}" to "${newAppName}" on the server, but failed to rename the ` +
@@ -2144,7 +2221,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             finalFolder = newFolder;
             if (wasWatching) {
-              await startWatchingFolder(context, output, activeWatchers, newFolder);
+              await startWatchingFolder(context, output, activeWatchers, newFolder, scheduleAutoCompile);
             }
           }
 
@@ -2363,54 +2440,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   );
 
-  // Auto-compile-on-save: saving a .java file always recompiles and
-  // re-uploads the *whole* app's Java, not just the saved file — Actions,
-  // SharedCode, and ScheduledActions can reference each other, so compiling
-  // one file in isolation could fail (or silently miss cross-file changes)
-  // in a way a single-file compile can't detect. Only fires for apps that
-  // are currently watched, matching how every other file type already only
-  // auto-uploads while watching. Debounced per app folder so saving several
-  // files in quick succession (e.g. Save All) triggers one compile, not one
-  // per file; a still-running compile for that folder is skipped rather
-  // than overlapped with a second javac invocation into the same zbin/.
-  const compileDebounce = new Map<string, ReturnType<typeof setTimeout>>();
-  const compilingFolders = new Set<string>();
-  const JAVA_SOURCE_FOLDERS = ["Actions", "SharedCode", "ScheduledActions"];
-
-  async function runAutoCompile(folder: vscode.Uri, savedRelativePath: string): Promise<void> {
-    const key = folder.toString();
-    if (compilingFolders.has(key)) {
-      output.appendLine(`Skipped auto-compile for ${folder.fsPath}: a compile is already in progress.`);
-      return;
-    }
-    compilingFolders.add(key);
-    output.appendLine(`Auto-compiling ${folder.fsPath} after saving "${savedRelativePath}"...`);
-    try {
-      const result = await compileAndUploadFolder(context, output, folder, compileStatus, javaDiagnostics);
-      if (result) {
-        output.appendLine(`Auto-compile: ${formatCompileSummary(result)}.`);
-        // Only pop a toast for sources that produced no output at all —
-        // ecj reporting errors but still uploading a stub (the common
-        // case now, see formatCompileSummary) is routine with
-        // -proceedOnError and would make every save with a lingering
-        // error noisy, defeating the point of "keep working despite
-        // errors".
-        if (result.failedSourceNames.length > 0) {
-          vscode.window.showWarningMessage(
-            `Tornado auto-compile: ${result.uploaded} uploaded, but ` +
-              `${result.failedSourceNames.join(", ")} produced no output at all — see the Tornado output channel.`,
-          );
-        }
-      }
-    } catch (error) {
-      logError(output, `Auto-compile failed: ${(error as Error).message}`);
-      output.show(true);
-      vscode.window.showErrorMessage(`Tornado auto-compile failed: ${(error as Error).message}`);
-    } finally {
-      compilingFolders.delete(key);
-    }
-  }
-
+  // The in-editor-save route into scheduleAutoCompile — an on-disk write
+  // made directly (by AppWatcher, for a file changed outside the editor)
+  // takes a separate route straight from the watcher, since this event
+  // never fires for that case at all.
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((document) => {
       if (!document.fileName.endsWith(".java")) {
@@ -2431,19 +2464,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!JAVA_SOURCE_FOLDERS.includes(typeFolder)) {
           continue;
         }
-
-        const key = watcher.appFolder.toString();
-        const existingTimer = compileDebounce.get(key);
-        if (existingTimer) {
-          clearTimeout(existingTimer);
-        }
-        compileDebounce.set(
-          key,
-          setTimeout(() => {
-            compileDebounce.delete(key);
-            void runAutoCompile(watcher.appFolder, relative);
-          }, 400),
-        );
+        scheduleAutoCompile(watcher.appFolder, relative);
         return;
       }
     }),

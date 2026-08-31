@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.23
+
+- Fixed: compiling a Java source was only ever triggered by an in-editor
+  save (`onDidSaveTextDocument`), which never fires for a `.java` file
+  written directly on disk — e.g. by an AI coding agent's edit tool. An
+  external edit to an *existing* Java source therefore reached neither the
+  watcher's upload path (correctly declined — Java needs compiling first,
+  not raw-uploading) nor a compile, and just sat there silently out of
+  date. The watcher now triggers the same debounced auto-compile for a
+  `.java` create/change event it sees directly, in addition to (not instead
+  of) the editor-save trigger — both share one debounce so several sources
+  changing together still produce a single compile.
+- Added: watching an app (opening it, syncing it, or "Tornado: Start
+  Watching") now also compares every `.java` source's modified time against
+  its compiled `.class` output and schedules a compile if anything is
+  stale or was never compiled at all — the one case the trigger above can't
+  catch, since an edit made while nothing was watching the app fires no
+  event at all to react to. Both respect the existing `tornado.compileOnSave`
+  setting.
+
 ## 0.0.22
 
 - Added: 0.0.21 made Java sources self-heal on every compile — an unmatched

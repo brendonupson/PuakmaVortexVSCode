@@ -69,6 +69,28 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
   }
 }
 
+// True when a .java source has no compiled output yet, or is newer than the
+// output it does have. A live edit already has a direct signal (the
+// onDidCreate/onDidChange event itself) and doesn't need this — it's for
+// AppWatcher.checkJavaFreshness(), which runs once when a watcher attaches
+// and has no event to react to: an edit made to an existing source while
+// nothing was watching this app never fires anything at all, so the only
+// way to notice it needs recompiling is to compare timestamps, the same
+// staleness check `make` uses.
+export async function isJavaSourceStale(appFolder: vscode.Uri, sourceRelativePath: string): Promise<boolean> {
+  const baseName = path.basename(sourceRelativePath, ".java");
+  const sourceUri = vscode.Uri.joinPath(appFolder, sourceRelativePath);
+  const classUri = vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER, `${baseName}.class`);
+  const [sourceStat, classStat] = await Promise.all([
+    vscode.workspace.fs.stat(sourceUri),
+    vscode.workspace.fs.stat(classUri).then(
+      (stat) => stat,
+      () => undefined,
+    ),
+  ]);
+  return !classStat || sourceStat.mtime > classStat.mtime;
+}
+
 async function findJarsRecursive(dir: vscode.Uri): Promise<string[]> {
   let entries: [string, vscode.FileType][];
   try {

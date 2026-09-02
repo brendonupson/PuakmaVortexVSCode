@@ -27,7 +27,7 @@ import {
   useSourceField,
   writeManifestFile,
 } from "./designSync";
-import { JAVA_SOURCE_FOLDERS, isJavaSourceStale } from "./javaCompiler";
+import { COMPILE_OUTPUT_FOLDER, JAVA_SOURCE_FOLDERS, findClassFilesRecursive, isJavaSourceStale } from "./javaCompiler";
 import { logError } from "./logging";
 
 // A change under here should be made through .tornado-manifest.json's
@@ -214,6 +214,12 @@ export class AppWatcher implements vscode.Disposable {
     if (!vscode.workspace.getConfiguration("tornado").get<boolean>("compileOnSave", true)) {
       return;
     }
+    // Walked once and shared across every isJavaSourceStale() call below,
+    // rather than one walk per source — this app can have hundreds of Java
+    // sources.
+    const compiledClassFiles = await findClassFilesRecursive(
+      vscode.Uri.joinPath(this.appFolder, COMPILE_OUTPUT_FOLDER),
+    );
     for (const folderName of JAVA_SOURCE_FOLDERS) {
       const dirUri = vscode.Uri.joinPath(this.appFolder, folderName);
       let entries: [string, vscode.FileType][];
@@ -227,7 +233,7 @@ export class AppWatcher implements vscode.Disposable {
           continue;
         }
         const relativePath = `${folderName}/${name}`;
-        if (await isJavaSourceStale(this.appFolder, relativePath)) {
+        if (await isJavaSourceStale(this.appFolder, relativePath, compiledClassFiles)) {
           this.scheduleJavaCompile(relativePath);
           return;
         }

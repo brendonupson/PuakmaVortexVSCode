@@ -69,6 +69,33 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
   }
 }
 
+// A source's package declaration (e.g. "package actions;") makes ecj's -d
+// nest its compiled output under outDir/actions/, not outDir directly, even
+// though the source itself sits flat (this codebase never places .java
+// files in package-matching subfolders — see designSync.ts's fileNameFor).
+// So finding a source's own class file, or every class file a batch
+// produced, has to walk outDir's subdirectories rather than assume a flat
+// layout. Exported so AppWatcher.checkJavaFreshness() can pass one shared
+// walk to every isJavaSourceStale() call instead of re-walking per source.
+export async function findClassFilesRecursive(dir: vscode.Uri): Promise<vscode.Uri[]> {
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return [];
+  }
+  const results: vscode.Uri[] = [];
+  for (const [name, type] of entries) {
+    const childUri = vscode.Uri.joinPath(dir, name);
+    if (type === vscode.FileType.Directory) {
+      results.push(...(await findClassFilesRecursive(childUri)));
+    } else if (type === vscode.FileType.File && name.endsWith(".class")) {
+      results.push(childUri);
+    }
+  }
+  return results;
+}
+
 // True when a .java source has no compiled output yet, or is newer than the
 // output it does have. A live edit already has a direct signal (the
 // onDidCreate/onDidChange event itself) and doesn't need this — it's for
@@ -77,16 +104,29 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
 // nothing was watching this app never fires anything at all, so the only
 // way to notice it needs recompiling is to compare timestamps, the same
 // staleness check `make` uses.
-export async function isJavaSourceStale(appFolder: vscode.Uri, sourceRelativePath: string): Promise<boolean> {
+//
+// compiledClassFiles lets a caller checking many sources in one pass (see
+// checkJavaFreshness) share a single findClassFilesRecursive walk instead of
+// each call re-walking outDir from scratch; omitted, it walks once itself.
+export async function isJavaSourceStale(
+  appFolder: vscode.Uri,
+  sourceRelativePath: string,
+  compiledClassFiles?: vscode.Uri[],
+): Promise<boolean> {
   const baseName = path.basename(sourceRelativePath, ".java");
   const sourceUri = vscode.Uri.joinPath(appFolder, sourceRelativePath);
-  const classUri = vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER, `${baseName}.class`);
+  const classFiles =
+    compiledClassFiles ??
+    (await findClassFilesRecursive(vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER)));
+  const classUri = classFiles.find((uri) => path.basename(uri.fsPath) === `${baseName}.class`);
   const [sourceStat, classStat] = await Promise.all([
     vscode.workspace.fs.stat(sourceUri),
-    vscode.workspace.fs.stat(classUri).then(
-      (stat) => stat,
-      () => undefined,
-    ),
+    classUri
+      ? vscode.workspace.fs.stat(classUri).then(
+          (stat) => stat,
+          () => undefined,
+        )
+      : Promise.resolve(undefined),
   ]);
   return !classStat || sourceStat.mtime > classStat.mtime;
 }
@@ -246,7 +286,7 @@ export interface CompileDiagnostic {
 }
 
 export interface CompileResult {
-  classFiles: vscode.Uri[]; // top-level only — one per compiled source, matched to its design element by name
+  classFiles: vscode.Uri[]; // one per compiled source, matched to its design element by name — may sit under outDir directly or nested by package (see findClassFilesRecursive)
   nestedClassFiles: vscode.Uri[]; // nested/inner/anonymous classes (e.g. Foo$Bar.class) — no source maps to these, so they're uploaded as SharedCode design elements instead, created on the server the first time each one is seen (see compileAndUploadFolder)
   hadErrors: boolean; // true if ecj reported errors — classFiles may still include stub classes for the affected sources (see compileApp)
   failedSourceNames: string[]; // base names (no extension) of sources that produced no class at all, even as a stub
@@ -425,21 +465,24 @@ export async function compileApp(
   const diagnostics = parseEcjDiagnostics(combinedOutput);
   const erroredSourceFiles = new Set(diagnostics.filter((d) => d.severity === "error").map((d) => d.fsPath));
 
-  const compiled = await vscode.workspace.fs.readDirectory(outDir);
+  // A source's own package declaration makes ecj's -d nest its class file
+  // under outDir/<package>/, not outDir itself, even though the source sits
+  // flat (see findClassFilesRecursive) — a top-level-only listing here would
+  // silently miss it and report the source as having produced no output at
+  // all.
+  const compiled = await findClassFilesRecursive(outDir);
   const classFiles: vscode.Uri[] = [];
   const nestedClassFiles: vscode.Uri[] = [];
-  for (const [name, type] of compiled) {
-    if (type !== vscode.FileType.File || !name.endsWith(".class")) {
-      continue;
-    }
+  for (const classUri of compiled) {
+    const name = path.basename(classUri.fsPath);
     if (name.includes("$")) {
       // Nested/inner/anonymous classes — no .java source of their own to
       // match a design element by name, so they're uploaded separately as
       // SharedCode design elements (see compileAndUploadFolder).
-      nestedClassFiles.push(vscode.Uri.joinPath(outDir, name));
+      nestedClassFiles.push(classUri);
       continue;
     }
-    classFiles.push(vscode.Uri.joinPath(outDir, name));
+    classFiles.push(classUri);
   }
   if (nestedClassFiles.length > 0) {
     output.appendLine(

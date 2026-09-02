@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.0.24
+
+- Fixed: a Java source declaring a `package` (e.g. `package actions;`)
+  compiled fine with ecj, but its `.class` output landed under
+  `zbin/<package>/`, not `zbin/` itself — ecj's `-d` nests output by
+  declared package regardless of where the source file actually sits, and
+  this codebase never places `.java` sources in package-matching
+  subfolders. The compile step only ever scanned the top level of `zbin/`,
+  so every packaged source's real, successful output was invisible to it:
+  it was reported as "produced no output at all" and never uploaded to the
+  server, indistinguishable from an actual compile failure. Compiled
+  output is now discovered recursively, so packaged sources compile and
+  upload correctly. `checkJavaFreshness()` (run when a watcher attaches)
+  had the same flat-path assumption when checking a source's compiled
+  `.class` for staleness — always treating a packaged source as stale — and
+  is fixed the same way, sharing one recursive scan across all of an app's
+  sources rather than re-walking `zbin/` per file.
+
 ## 0.0.23
 
 - Fixed: compiling a Java source was only ever triggered by an in-editor

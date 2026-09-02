@@ -801,8 +801,22 @@ are now implemented (with some deliberate gaps noted below). See the
   sync/refresh — so an app synced before this wiring existed (or before it
   needed more source folders than it had at the time) still gets configured
   the next time it's compiled, rather than needing an explicit re-sync.
-  Requires the `redhat.java` extension to be installed; if it isn't, this is
-  skipped with a note in the "Tornado" output channel rather than failing.
+  Both settings are declared `"scope": "window"` by `redhat.java` itself —
+  VS Code only allows one shared value per window, never one per app folder
+  — so with more than one app synced/opened in the same window and not
+  explicitly closed (see `Tornado: Close Application` above), `redhat.java`
+  merges all of their source folders and jars into one shared project. That
+  can surface as cross-app IntelliSense errors — e.g. a `SharedCode` field
+  reference failing to resolve because another open app happens to have a
+  class of the same name — even though the two apps have nothing to do with
+  each other. This is editor-only: the actual `ecj` compile classpath is
+  built fresh per app in `javaCompiler.ts` from just that app's own
+  `SharedCode` and connection, so real compiles and uploads aren't affected.
+  Run `Tornado: Close Application` for apps you're not actively editing, or
+  use separate VS Code windows, if you need reliable IntelliSense with
+  several apps open at once. Requires the `redhat.java` extension to be
+  installed; if it isn't, this is skipped with a note in the "Tornado"
+  output channel rather than failing.
   The Java language server can need a reload or "Java: Clean the Java
   Language Server Workspace" to pick up newly-added entries — the extension
   prompts for that the first time it adds one.

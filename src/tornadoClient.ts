@@ -1,5 +1,17 @@
 import * as vscode from "vscode";
+import { gzip } from "node:zlib";
+import { promisify } from "node:util";
 import { logError } from "./logging";
+
+const gzipAsync = promisify(gzip);
+
+// Below this, gzip's own ~20-byte header/trailer overhead (plus the extra
+// Content-Encoding header) can make a request *larger* than sending it
+// uncompressed, for no benefit — so only bodies at or above this size are
+// compressed. The small CRUD payloads (keywords/tables/columns/params) tend
+// to land under it; the design-element uploads this is really for (base64
+// class/resource bytes wrapped in JSON) are always well above it.
+const GZIP_MIN_BYTES = 1024;
 
 export interface InventoryItem {
   appid: number;
@@ -279,11 +291,25 @@ export class TornadoClient {
     // "the server received no data" is otherwise indistinguishable from
     // "the client sent none". Bodies here are either JSON or base64-encoded
     // file content, so a size alone is enough for the big ones.
+    let body: RequestInit["body"] = init?.body;
+    let headers = init?.headers;
     if (typeof init?.body === "string") {
       const bytes = Buffer.byteLength(init.body);
-      this.output?.appendLine(
-        `→ ${method} ${url} — ${bytes} byte body` + (bytes <= 2000 ? `: ${init.body}` : ""),
-      );
+      const preview = bytes <= 2000 ? `: ${init.body}` : "";
+      // The server accepts gzip-encoded request bodies — worth it here since
+      // a design element's designdata/designsource is base64 (already ~33%
+      // bigger than the raw file) wrapped in JSON on top of that.
+      const gzipEnabled = vscode.workspace.getConfiguration("tornado").get<boolean>("gzipUploads", true);
+      if (gzipEnabled && bytes >= GZIP_MIN_BYTES) {
+        const compressed = await gzipAsync(init.body);
+        body = compressed;
+        headers = { ...headers, "Content-Encoding": "gzip" };
+        this.output?.appendLine(
+          `→ ${method} ${url} — ${bytes} byte body, gzipped to ${compressed.byteLength}${preview}`,
+        );
+      } else {
+        this.output?.appendLine(`→ ${method} ${url} — ${bytes} byte body${preview}`);
+      }
     } else {
       this.output?.appendLine(`→ ${method} ${url}`);
     }
@@ -292,8 +318,9 @@ export class TornadoClient {
     try {
       response = await fetch(url, {
         ...init,
+        body,
         headers: {
-          ...init?.headers,
+          ...headers,
           Authorization: this.buildAuthHeader(),
         },
       });

@@ -72,6 +72,16 @@ async function addSourcePaths(config: vscode.WorkspaceConfiguration, appFolder: 
 // without these settings (this is separate from, and doesn't affect, the
 // actual javac compile classpath in javaCompiler.ts).
 //
+// Both REFERENCED_LIBRARIES_KEY and SOURCE_PATHS_KEY are declared
+// "scope": "window" by redhat.java itself — VS Code only allows one shared
+// value per window, never one per app folder — and entries are only ever
+// merged in here, removed solely by removeJavaIntelliSense() on "Close
+// Application". So with more than one app synced/compiled in the same
+// window and not explicitly closed, redhat.java treats all of them as one
+// shared project: a name collision between two open apps' classes can
+// resolve to the wrong one. Not fixable from this side; see the "Java
+// editor IntelliSense" note in README.md.
+//
 // Returns true if a workspace setting was just added/changed (the Java
 // language server can need a reload or "Clean Workspace" to pick that up).
 export async function ensureJavaIntelliSense(

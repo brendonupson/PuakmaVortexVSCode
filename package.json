@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.24",
+  "version": "0.0.25",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -166,6 +166,11 @@
           "type": "boolean",
           "default": true,
           "description": "When a watched application's .tornado-manifest.json is edited directly on disk (e.g. by an external tool or an AI coding agent), push the resulting designparams/appparams/dataconnections changes to the Tornado server the same way the interactive editing commands do (a dataconnections edit that deletes a table, column, or connection is still confirmed before anything is actually deleted). Disable to hand-edit the manifest offline without triggering a live push."
+        },
+        "tornado.gzipUploads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Gzip-compress PUT/POST request bodies (with a Content-Encoding: gzip header) before sending them to the Tornado server, to reduce upload size — most useful for design element uploads, which wrap file content as base64 inside JSON. Disable if a server or proxy in front of it doesn't accept gzip-encoded request bodies."
         }
       }
     },

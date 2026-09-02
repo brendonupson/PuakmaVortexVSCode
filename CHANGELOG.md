@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.0.25
+
+- Added: PUT/POST request bodies are now gzip-compressed (with a
+  `Content-Encoding: gzip` header) before being sent to the Tornado server,
+  which accepts gzip-encoded uploads. Worth the most for design element
+  uploads — `designdata`/`designsource` is base64 (already ~33% bigger than
+  the raw file) wrapped in JSON on top of that — so this cuts upload size
+  and time, especially for compiled Java classes, jars, and larger
+  Pages/Resources. Added centrally in `TornadoClient`'s single `request()`
+  method, so it covers every PUT/POST endpoint without touching each call
+  site. Bodies under 1KB are left uncompressed, since gzip's own overhead
+  can make a tiny body larger, not smaller. New `tornado.gzipUploads`
+  setting (default on) to disable it if a server or proxy in front of it
+  doesn't accept gzip-encoded request bodies.
+- Documented: with more than one Tornado app synced/open in the same VS
+  Code window (and not explicitly closed via `Tornado: Close Application`),
+  `redhat.java`'s `java.project.sourcePaths`/`referencedLibraries` settings
+  — window-scoped by `redhat.java` itself, not something this extension can
+  scope per app — merge every such app's source folders and jars into one
+  shared IntelliSense project. This can surface as cross-app editor errors,
+  e.g. a `SharedCode` field failing to resolve because another open app has
+  a same-named class. Editor-only: actual compiles and uploads are
+  unaffected, since each app's `ecj` classpath is still built fresh per app.
+
 ## 0.0.24
 
 - Fixed: a Java source declaring a `package` (e.g. `package actions;`)

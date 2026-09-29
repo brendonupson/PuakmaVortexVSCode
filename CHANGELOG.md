@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.26
+
+- Fixed: the selected connection is now per VS Code window. It was kept in
+  `globalState`, which every window shares, so switching connection (or the
+  Tornado view following it) in one window changed all of them. It now lives
+  in `workspaceState`; the saved connection list is still global. Each
+  workspace starts with no active connection until one is picked.
+- Fixed: opening an app from the Inventory tree now always attaches the file
+  watcher after syncing. Previously it only resumed a watcher that had been
+  running earlier in the same session, so after restarting VS Code the watcher
+  was left behind an optional "Start Watching" button and often never started.
+
 ## 0.0.25
 
 - Added: PUT/POST request bodies are now gzip-compressed (with a

@@ -1543,27 +1543,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => syncDesignToFolder(context, output, activeWatchers, folder, appid, connection.id, true),
           );
 
-          if (wasWatching) {
-            // Only ever stopped by the reset path; restart it so "opening"
-            // an app that was being watched doesn't quietly stop watching it.
-            if (!activeWatchers.has(folder.toString())) {
-              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
-              output.appendLine(`Resumed watching ${folder.fsPath}.`);
-            }
-            vscode.window.showInformationMessage(
-              `Synced ${result.written} design element(s) to ${folder.fsPath}`,
-            );
-          } else {
-            const startWatchingAction = "Start Watching";
-            const choice = await vscode.window.showInformationMessage(
-              `Synced ${result.written} design element(s) to ${folder.fsPath}`,
-              startWatchingAction,
-            );
-            if (choice === startWatchingAction) {
-              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
-              vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
-            }
+          // Always (re)attach the watcher: opening an app from the tree means
+          // the user is about to edit it, and after a VS Code restart nothing
+          // is watching yet (wasWatching is false), so leaving it behind an
+          // optional notification action meant it silently never attached.
+          if (!activeWatchers.has(folder.toString())) {
+            await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
+            output.appendLine(`${wasWatching ? "Resumed" : "Started"} watching ${folder.fsPath}.`);
           }
+          vscode.window.showInformationMessage(
+            `Synced ${result.written} design element(s) to ${folder.fsPath}. Watching for local changes.`,
+          );
         } catch (error) {
           logError(output, `Sync failed: ${(error as Error).message}`);
           output.show(true);

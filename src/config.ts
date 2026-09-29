@@ -72,17 +72,17 @@ export async function removeConnection(
 }
 
 export function getActiveConnectionId(context: vscode.ExtensionContext): string | undefined {
-  // globalState (not workspaceState): the active connection should carry
-  // over between windows/folders, matching how the connection list itself
-  // is now stored globally.
-  return context.globalState.get<string>(ACTIVE_CONNECTION_KEY);
+  // workspaceState (not globalState): globalState is shared by every VS Code
+  // window, so switching connection in one would silently switch all of them.
+  // The connection list stays global; the selection is per window/workspace.
+  return context.workspaceState.get<string>(ACTIVE_CONNECTION_KEY);
 }
 
 export async function setActiveConnectionId(
   context: vscode.ExtensionContext,
   id: string | undefined,
 ): Promise<void> {
-  await context.globalState.update(ACTIVE_CONNECTION_KEY, id);
+  await context.workspaceState.update(ACTIVE_CONNECTION_KEY, id);
 }
 
 export function getActiveConnection(

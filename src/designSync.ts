@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 import {
   AppParam,
@@ -237,6 +238,12 @@ export interface ManifestEntry {
   // from there. Purely a local cache of "what did we last send"; never
   // synced by diffManifestParams() and never sent to the server itself.
   uploadedHash?: string;
+  // SHA-256 hex digest of the source bytes exactly as written by the last
+  // sync/refresh (Java elements only). Lets the first compile after a sync
+  // recognise an element whose source hasn't been touched locally and skip
+  // re-uploading it: the server already has that source, so there's nothing
+  // to send. Dropped as soon as the element is uploaded from here.
+  syncedSourceHash?: string;
 }
 
 // A column as it sits in the manifest — every field the server's <column>
@@ -532,6 +539,10 @@ export async function writeDesignElements(
       comment: element.comment,
       options: element.options,
       designparams: element.designparams,
+      syncedSourceHash:
+        !nestedClass && [3, 4, 6].includes(element.designtype)
+          ? createHash("sha256").update(bytes).digest("hex")
+          : undefined,
     });
   }
 

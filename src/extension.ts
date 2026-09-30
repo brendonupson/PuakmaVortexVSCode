@@ -409,6 +409,20 @@ async function compileAndUploadFolder(
       unchanged++;
       continue;
     }
+    // Never uploaded from here, and the source is byte-identical to what the
+    // last sync wrote: the server already has this element, so the compile
+    // that follows a sync/open must not re-upload it. Record the baseline so
+    // later compiles track changes normally.
+    if (
+      entry.uploadedHash === undefined &&
+      entry.syncedSourceHash !== undefined &&
+      entry.syncedSourceHash === createHash("sha256").update(sourceBytes).digest("hex")
+    ) {
+      entry.uploadedHash = hash;
+      manifestChanged = true;
+      unchanged++;
+      continue;
+    }
 
     const payload: DesignElementPayload = {
       designbucketid: entry.designbucketid,
@@ -425,6 +439,7 @@ async function compileAndUploadFolder(
     };
     await client.updateDesignElement(manifest.appid, entry.designbucketid, payload);
     entry.uploadedHash = hash;
+    entry.syncedSourceHash = undefined;
     manifestChanged = true;
     output.appendLine(`Uploaded compiled "${entry.name}" (${classBytes.length} bytes).`);
     uploaded++;
@@ -444,6 +459,15 @@ async function compileAndUploadFolder(
     const entry = manifest.elements.find((e) => e.name === className && e.designtype === 4);
     if (entry) {
       if (entry.uploadedHash === hash) {
+        unchanged++;
+        continue;
+      }
+      // Same idea as the top-level case above: a nested class has no source
+      // of its own, so if nothing else in this batch needed uploading (no
+      // parent source changed since the sync), adopt it as the baseline.
+      if (entry.uploadedHash === undefined && uploaded === 0) {
+        entry.uploadedHash = hash;
+        manifestChanged = true;
         unchanged++;
         continue;
       }
@@ -1543,17 +1567,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => syncDesignToFolder(context, output, activeWatchers, folder, appid, connection.id, true),
           );
 
-          // Always (re)attach the watcher: opening an app from the tree means
-          // the user is about to edit it, and after a VS Code restart nothing
-          // is watching yet (wasWatching is false), so leaving it behind an
-          // optional notification action meant it silently never attached.
-          if (!activeWatchers.has(folder.toString())) {
-            await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
-            output.appendLine(`${wasWatching ? "Resumed" : "Started"} watching ${folder.fsPath}.`);
+          if (wasWatching) {
+            // Only ever stopped by the reset path; restart it so "opening"
+            // an app that was being watched doesn't quietly stop watching it.
+            if (!activeWatchers.has(folder.toString())) {
+              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
+              output.appendLine(`Resumed watching ${folder.fsPath}.`);
+            }
+            vscode.window.showInformationMessage(
+              `Synced ${result.written} design element(s) to ${folder.fsPath}`,
+            );
+          } else {
+            // Optional: sometimes the user wants to open an app without
+            // auto-uploading local changes.
+            const startWatchingAction = "Start Watching";
+            const choice = await vscode.window.showInformationMessage(
+              `Synced ${result.written} design element(s) to ${folder.fsPath}`,
+              startWatchingAction,
+            );
+            if (choice === startWatchingAction) {
+              await startWatchingFolder(context, output, activeWatchers, folder, scheduleAutoCompile);
+              vscode.window.showInformationMessage(`Watching ${folder.fsPath} for local changes.`);
+            }
           }
-          vscode.window.showInformationMessage(
-            `Synced ${result.written} design element(s) to ${folder.fsPath}. Watching for local changes.`,
-          );
         } catch (error) {
           logError(output, `Sync failed: ${(error as Error).message}`);
           output.show(true);

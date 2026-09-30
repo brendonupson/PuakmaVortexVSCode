@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.27
+
+- Changed: opening an app from the Inventory tree prompts with "Start Watching"
+  again instead of always attaching the file watcher, so an app can be opened
+  without auto-uploading local changes. A watcher that was already running in
+  the session is still resumed automatically.
+- Fixed: the compile that runs after a sync no longer re-uploads every Java
+  element. Sync now records a hash of each Java source (`syncedSourceHash` in
+  the manifest); the first compile skips elements whose source is unchanged
+  from that sync and only uploads real local changes.
+
 ## 0.0.26
 
 - Fixed: the selected connection is now per VS Code window. It was kept in

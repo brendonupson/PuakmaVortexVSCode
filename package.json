@@ -2,7 +2,7 @@
   "name": "tornado-vscode",
   "displayName": "Vortex IDE for Tornado Server",
   "description": "Develop applications on Puakma Tornado application server: browse the server inventory and sync an application's design elements (CSS, JS, HTML, XML, XSL, text, Java) into your workspace.",
-  "version": "0.0.27",
+  "version": "0.0.28",
   "publisher": "webwiseAU",
   "private": false,
   "license": "GPL-3.0-or-later",
@@ -138,7 +138,11 @@
                 "description": "Base URL of the Tornado application server, e.g. https://tornado.example.com/system/webdesign.pma"
               }
             },
-            "required": ["id", "name", "serverUrl"]
+            "required": [
+              "id",
+              "name",
+              "serverUrl"
+            ]
           }
         },
         "tornado.javaHome": {
@@ -153,7 +157,9 @@
         },
         "tornado.compileClasspath": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Optional extra jar/directory paths to add to the Java compile classpath, beyond the server's own puakma.jar and shared libraries (downloaded automatically via /vortex/systemjar and /vortex/libraries)."
         },

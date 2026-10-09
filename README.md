@@ -356,19 +356,19 @@ are now implemented (with some deliberate gaps noted below). See the
 - **Editing application parameters** (`APPPARAM`): `Tornado: Edit Application
   Parameters`, from the Command Palette or by right-clicking a synced app's
   folder in the Explorer, edits the application's key/value parameters. The
-  dialog is the same QuickPick loop the two property editors use, listing ten
-  well-known parameter names with their current values: `OpenAction`,
+  dialog is the same QuickPick loop the two property editors use, listing
+  eleven well-known parameter names with their current values: `OpenAction`,
   `OpenAction1`, `SaveAction`, `SaveAction1` (picked from the app's Actions),
   `LoginPage` (picked from its Pages), `DefaultOpen` (free text),
-  `DisableApp`, `DisableScheduledActions`, `ForceSecureConn` (set to `1` or
-  not set at all), and `DefaultLocale` (picked from a locale list showing
+  `DisableApp`, `DisableScheduledActions`, `ForceSecureConn`,
+  `SkipSystemAuthenticators` (set to `1` or not set at all), and `DefaultLocale` (picked from a locale list showing
   e.g. "English (Australia)" while storing `en-AU`). Action/Page choices come
   from the local manifest — i.e. the last sync — so every choice list also
   offers manual entry for a value that exists server-side but isn't synced
   locally. Locale labels are generated with `Intl.DisplayNames`
   (`languageDisplay: "standard"`, with a hand-composed fallback for older ICU
   builds that ignore the option, which would otherwise render "Australian
-  English"). Parameters the application already has beyond those ten are
+  English"). Parameters the application already has beyond those eleven are
   listed after them as free text and re-sent as-is — the client never drops
   one it doesn't recognise, though whether the server persists a name outside
   its own list is up to the server.

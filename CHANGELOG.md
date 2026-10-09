@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.28
+
+- Added: `SkipSystemAuthenticators` to `Tornado: Edit Application Parameters`
+  as a flag (set to `1` or not set at all), alongside `ForceSecureConn`.
+
 ## 0.0.27
 
 - Changed: opening an app from the Inventory tree prompts with "Start Watching"

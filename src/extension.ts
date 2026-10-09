@@ -993,6 +993,7 @@ function buildAppParamFields(manifest: Manifest, current: AppParam[]): EditableF
         describe: localeLabel,
       },
       flagParamField("ForceSecureConn", "Force connections to this application over HTTPS"),
+      flagParamField("SkipSystemAuthenticators", "Skip the system authenticators for this application"),
     ],
     current,
   );

@@ -32,6 +32,7 @@ import {
   Manifest,
   ManifestEntry,
   MANIFEST_FILENAME,
+  assertSafeDesignElementName,
   designTypeFolder,
   ensureDevConfig,
   fileNameFor,
@@ -1091,9 +1092,9 @@ async function pruneOrphanedLibraryCache(
 
 // Given a file open in the editor (or right-clicked in the Explorer), walks
 // up its ancestors looking for a synced app's manifest — a design element's
-// path is always exactly two levels under its app folder (<DesignTypeFolder>/
-// <file>), but walking rather than hardcoding that depth means this keeps
-// working if that ever changes. devconfig.json is excluded even though it is
+// path is at least two levels under its app folder (<DesignTypeFolder>/<file>,
+// deeper when the element's name contains "/"), so this walks rather than
+// hardcoding a depth. devconfig.json is excluded even though it is
 // now a real Documentation element on the server: it's the extension's own
 // configuration, and renaming or re-pointing it through the design-element
 // property editors would only break the lookup that reads it.
@@ -2015,7 +2016,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const oldPath = entry.path;
         const newName = (edits.name ?? oldName).trim();
         try {
-          assertSafePathSegment(newName, "design element name");
+          assertSafeDesignElementName(newName, entry.designtype);
         } catch (error) {
           vscode.window.showErrorMessage((error as Error).message);
           return;
@@ -2098,13 +2099,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // The same fileNameFor() writeDesignElements uses for the
             // download direction — keeps the local filename in step with what
             // the next refresh-from-server would produce anyway.
-            const folderPart = oldPath.slice(0, oldPath.lastIndexOf("/"));
+            // The design-type folder is the path's first segment — anything
+            // after it came from a "/" in the old name, so it's replaced
+            // wholesale by the new name's own subfolders (if any).
+            const folderPart = oldPath.split("/")[0];
             const newFileName = fileNameFor(newName, entry.designtype, entry.contenttype);
             const newPath = `${folderPart}/${newFileName}`;
             entry.path = newPath;
 
             const oldUri = vscode.Uri.joinPath(appFolder, oldPath);
             const newUri = vscode.Uri.joinPath(appFolder, newPath);
+            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(newUri, ".."));
             const renameEdit = new vscode.WorkspaceEdit();
             renameEdit.renameFile(oldUri, newUri, { overwrite: false });
             // Goes through a WorkspaceEdit rather than workspace.fs.rename

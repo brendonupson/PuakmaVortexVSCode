@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.29
+
+- Added: design element names may contain `/`, stored locally in subfolders
+  beneath the design-type folder — e.g. a Resource named `css/animate.css` is
+  written to `Resources/css/animate.css`. New files created in such subfolders
+  are created on the server with the matching name, deleting a subfolder
+  offers to delete its elements from the server, and renames move the file
+  between subfolders. Not allowed for the Java types (Actions, SharedCode,
+  ScheduledActions), whose names are Java class names.
+
 ## 0.0.28
 
 - Added: `SkipSystemAuthenticators` to `Tornado: Edit Application Parameters`

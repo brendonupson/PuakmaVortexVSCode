@@ -17,6 +17,7 @@ import {
   ManifestEntry,
   ManifestTable,
   MANIFEST_FILENAME,
+  assertSafeDesignElementName,
   diffManifestDataConnections,
   diffManifestParams,
   folderToDesignType,
@@ -33,6 +34,26 @@ import { logError } from "./logging";
 // A change under here should be made through .tornado-manifest.json's
 // "dataconnections" section, not by hand-editing the dump directly.
 const DATA_CONNECTIONS_FOLDER = "DataConnections/";
+
+// Every file beneath dir, as "/"-joined paths relative to it. A missing dir
+// is just empty.
+async function listFilesRecursive(dir: vscode.Uri, prefix = ""): Promise<string[]> {
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const [name, type] of entries) {
+    if (type === vscode.FileType.File) {
+      files.push(`${prefix}${name}`);
+    } else if (type === vscode.FileType.Directory) {
+      files.push(...(await listFilesRecursive(vscode.Uri.joinPath(dir, name), `${prefix}${name}/`)));
+    }
+  }
+  return files;
+}
 
 function tablePayload(table: ManifestTable): NewTablePayload {
   return { tablename: table.tablename, buildorder: table.buildorder, description: table.description };
@@ -132,14 +153,9 @@ export class AppWatcher implements vscode.Disposable {
   async reconcileUntracked(): Promise<void> {
     const candidates: { folderName: string; name: string; relativePath: string }[] = [];
     for (const folderName of DESIGN_TYPE_FOLDER_NAMES) {
-      const dirUri = vscode.Uri.joinPath(this.appFolder, folderName);
-      let entries: [string, vscode.FileType][];
-      try {
-        entries = await vscode.workspace.fs.readDirectory(dirUri);
-      } catch {
-        continue;
-      }
-      for (const [name, type] of entries) {
+      // Recursive — a file in a subfolder is an element whose name contains
+      // "/" (see assertSafeDesignElementName).
+      for (const name of await listFilesRecursive(vscode.Uri.joinPath(this.appFolder, folderName))) {
         const relativePath = `${folderName}/${name}`;
         // Hidden/OS/editor housekeeping files (.DS_Store, .swp, ...) are not
         // design elements — and for a bare-name design type (Pages, Actions,
@@ -147,21 +163,28 @@ export class AppWatcher implements vscode.Disposable {
         // non-extension part at all, which would create one with an empty
         // server name.
         if (
-          type !== vscode.FileType.File ||
-          name.startsWith(".") ||
+          name.split("/").some((part) => part.startsWith(".")) ||
           relativePath === DEV_CONFIG_RELATIVE_PATH ||
           this.findEntry(relativePath)
         ) {
           continue;
         }
-        const dot = name.lastIndexOf(".");
-        const ext = dot >= 0 ? name.slice(dot) : "";
+        const lastPart = name.slice(name.lastIndexOf("/") + 1);
+        const dot = lastPart.lastIndexOf(".");
+        const ext = dot >= 0 ? lastPart.slice(dot) : "";
         // folderName always maps to a designtype — it came from
         // DESIGN_TYPE_FOLDER_NAMES, folderToDesignType()'s own domain.
         const designtype = folderToDesignType(folderName) as number;
         if (isJavaSourceUpload(designtype, ext)) {
           // Left for the next compile to pick up (see compileAndUploadFolder)
           // rather than listed here as if this sweep would create it.
+          continue;
+        }
+        try {
+          // e.g. a file in a subfolder of a Java-source folder — handleCreate
+          // would only skip it.
+          assertSafeDesignElementName(name, designtype);
+        } catch {
           continue;
         }
         candidates.push({ folderName, name, relativePath });
@@ -196,7 +219,7 @@ export class AppWatcher implements vscode.Disposable {
     // this loop's next handleCreate() over the same this.manifest object.
     await this.runSuppressed(async () => {
       for (const candidate of candidates) {
-        const uri = vscode.Uri.joinPath(this.appFolder, candidate.folderName, candidate.name);
+        const uri = vscode.Uri.joinPath(this.appFolder, candidate.folderName, ...candidate.name.split("/"));
         await this.handleCreate(uri);
       }
     });
@@ -337,8 +360,11 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
 
-    const [folder, fileName, ...rest] = relativePath.split("/");
-    if (!folder || !fileName || rest.length > 0) {
+    // Anything below the design-type folder is the element's name — a file
+    // in a subfolder (Resources/css/animate.css) becomes "css/animate.css".
+    const [folder, ...nameParts] = relativePath.split("/");
+    const fileName = nameParts.join("/");
+    if (!folder || !fileName) {
       this.output.appendLine(`Skipped "${relativePath}": expected <DesignTypeFolder>/<file>.`);
       return;
     }
@@ -348,12 +374,19 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
 
-    const dot = fileName.lastIndexOf(".");
-    const ext = dot >= 0 ? fileName.slice(dot) : "";
-    const baseName = dot >= 0 ? fileName.slice(0, dot) : fileName;
+    const lastPart = nameParts[nameParts.length - 1];
+    const dot = lastPart.lastIndexOf(".");
+    const ext = dot >= 0 ? lastPart.slice(dot) : "";
+    const baseName = fileName.slice(0, fileName.length - ext.length);
 
     if (isJavaSourceUpload(designtype, ext)) {
       this.triggerJavaCompileOrExplain(relativePath, ext);
+      return;
+    }
+    try {
+      assertSafeDesignElementName(fileName, designtype);
+    } catch (error) {
+      this.output.appendLine(`Skipped "${relativePath}": ${(error as Error).message}`);
       return;
     }
 
@@ -807,6 +840,13 @@ export class AppWatcher implements vscode.Disposable {
     }
     const entry = this.findEntry(relativePath);
     if (!entry) {
+      // Deleting a subfolder (e.g. Resources/css/) can surface as a single
+      // event for the folder rather than one per file inside it.
+      const prefix = `${relativePath}/`;
+      const nested = this.manifest.elements.filter((e) => e.path.startsWith(prefix));
+      if (nested.length > 0) {
+        await this.handleFolderDelete(relativePath, nested);
+      }
       return;
     }
 
@@ -835,5 +875,50 @@ export class AppWatcher implements vscode.Disposable {
         `Failed to delete "${entry.name}" from the Tornado server: ${(error as Error).message}`,
       );
     }
+  }
+  private async handleFolderDelete(relativePath: string, entries: ManifestEntry[]): Promise<void> {
+    // A delete event can also fire for a folder that still exists (e.g. a
+    // spurious event during an atomic rename) — only act on files that are
+    // really gone.
+    const gone: ManifestEntry[] = [];
+    for (const entry of entries) {
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.appFolder, ...entry.path.split("/")));
+      } catch {
+        gone.push(entry);
+      }
+    }
+    if (gone.length === 0) {
+      return;
+    }
+
+    const confirmAction = "Delete from Server";
+    const list = gone.map((e) => `- ${e.name}`).join("\n");
+    const confirmed = await vscode.window.showWarningMessage(
+      `"${relativePath}" was deleted locally. Also delete these ${gone.length} design element(s) from the ` +
+        `Tornado server? This cannot be undone.\n\n${list}`,
+      { modal: true },
+      confirmAction,
+    );
+    if (confirmed !== confirmAction) {
+      this.output.appendLine(
+        `Kept ${gone.length} design element(s) under "${relativePath}" on the server (local folder deleted, ` +
+          "server unchanged).",
+      );
+      return;
+    }
+
+    for (const entry of gone) {
+      try {
+        await this.client.deleteDesignElement(this.appid, entry.designbucketid);
+        this.manifest.elements = this.manifest.elements.filter((e) => e !== entry);
+        this.output.appendLine(`Deleted "${entry.name}" from the server.`);
+      } catch (error) {
+        vscode.window.showErrorMessage(
+          `Failed to delete "${entry.name}" from the Tornado server: ${(error as Error).message}`,
+        );
+      }
+    }
+    await this.persistManifest();
   }
 }

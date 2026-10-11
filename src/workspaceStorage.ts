@@ -14,6 +14,22 @@ export function assertSafePathSegment(segment: string, label: string): void {
   }
 }
 
+// Like assertSafePathSegment, but for a name allowed to contain "/" — each
+// "/"-separated part becomes a local subfolder (e.g. a Resource named
+// "css/animate.css" is stored at Resources/css/animate.css), so every part
+// gets the same guard. A leading, trailing or doubled "/" leaves an empty
+// part and is rejected along with "." and "..".
+export function assertSafeRelativePath(name: string, label: string): void {
+  if (!name) {
+    throw new Error(`Invalid ${label} "${name}": cannot be used as a file name.`);
+  }
+  for (const segment of name.split("/")) {
+    if (!segment || segment === "." || segment === ".." || segment.includes("\\")) {
+      throw new Error(`Invalid ${label} "${name}": cannot be used as a file path.`);
+    }
+  }
+}
+
 export function folderName(connectionName: string, app: Pick<InventoryItem, "appgroup" | "appname">): string {
   // appgroup is optional (can be ""), so it's dropped rather than leaving a
   // stray double underscore.

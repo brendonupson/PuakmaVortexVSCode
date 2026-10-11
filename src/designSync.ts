@@ -10,7 +10,7 @@ import {
   Table,
   TornadoClient,
 } from "./tornadoClient";
-import { assertSafePathSegment } from "./workspaceStorage";
+import { assertSafePathSegment, assertSafeRelativePath } from "./workspaceStorage";
 import { logError } from "./logging";
 
 const DESIGN_TYPE_FOLDERS: Record<number, string> = {
@@ -191,6 +191,19 @@ export function useSourceField(designtype: number, contenttype: string): boolean
 // instead — bytecode only, never fed back into a compile.
 export function isNestedJavaClassName(designtype: number, name: string): boolean {
   return JAVA_SOURCE_DESIGN_TYPES.has(designtype) && name.includes("$");
+}
+
+// A "/" in a design element name maps to a local subfolder beneath its
+// design-type folder (Resource "css/animate.css" -> Resources/css/animate.css).
+// Not for the Java-source types: there the name is a Java class name, and
+// the compiler (see compileAndUploadFolder) only walks each folder's top
+// level and maps a source back by its basename.
+export function assertSafeDesignElementName(name: string, designtype: number): void {
+  if (JAVA_SOURCE_DESIGN_TYPES.has(designtype)) {
+    assertSafePathSegment(name, "design element name");
+  } else {
+    assertSafeRelativePath(name, "design element name");
+  }
 }
 
 // Java source/class changes under Actions/SharedCode/ScheduledActions are
@@ -509,16 +522,18 @@ export async function writeDesignElements(
   }
 
   for (const element of elements) {
-    assertSafePathSegment(element.name, "design element name");
+    assertSafeDesignElementName(element.name, element.designtype);
 
     const nestedClass = isNestedJavaClassName(element.designtype, element.name);
     const folder = DESIGN_TYPE_FOLDERS[element.designtype] ?? `Type${element.designtype}`;
     const fileName = fileNameFor(element.name, element.designtype, element.contenttype);
 
-    if (!(element.designtype in DESIGN_TYPE_FOLDERS)) {
-      // Not one of the known types — its folder wasn't pre-created above.
-      await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(appFolder, folder));
-    }
+    // Covers both an unknown type's folder (not pre-created above) and any
+    // subfolder from a "/" in the name (e.g. Resources/css/).
+    const slash = fileName.lastIndexOf("/");
+    await vscode.workspace.fs.createDirectory(
+      vscode.Uri.joinPath(appFolder, folder, ...(slash >= 0 ? [fileName.slice(0, slash)] : [])),
+    );
 
     const base64 = nestedClass || !useSourceField(element.designtype, element.contenttype)
       ? element.designdata

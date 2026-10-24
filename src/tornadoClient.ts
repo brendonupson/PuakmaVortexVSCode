@@ -271,6 +271,18 @@ export type DesignElementPayload = Omit<DesignElement, "updatedby" | "updated">;
 // real request, see TornadoClient.createDesignElement.
 export type NewDesignElementPayload = Omit<DesignElementPayload, "designbucketid">;
 
+// The server answered with a non-2xx status — as opposed to a network error
+// or an unexpected response body, where the request may well have taken
+// effect.
+export class TornadoHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 export class TornadoClient {
   constructor(
     private readonly serverUrl: string,
@@ -339,7 +351,8 @@ export class TornadoClient {
         `✘ ${method} ${url} — ${response.status} ${response.statusText}` +
           (body ? `\n${body.slice(0, 2000)}` : ""),
       );
-      throw new Error(
+      throw new TornadoHttpError(
+        response.status,
         `Tornado server responded with ${response.status} ${response.statusText} for ${method} ${url}` +
           (body ? `: ${body.slice(0, 500)}` : ""),
       );

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.0.30
+
+- Fixed: a design element created by the watcher (e.g. a new
+  `Pages/Xxxxxxx.phtml` written by an external process) is now reliably
+  recorded in `.tornado-manifest.json`:
+  - If the create request errors after the server has already made the
+    element (e.g. a response without a `designbucketid`), the element is
+    looked up on the server and tracked instead of being created again on the
+    next save. If the server refused the create because the name already
+    exists, you're asked before tracking the existing element.
+  - Create + change events for the same new file no longer create two copies.
+  - Manifest updates after a create/delete re-read the file and merge into it,
+    serialised with manifest-change handling, so an external edit isn't
+    overwritten.
+  - If an external process rewrites the manifest without an entry whose file
+    still exists, the entry is restored.
+  - A hand-written manifest entry without a `designbucketid` is treated as
+    not yet on the server; its comment/options/parameters seed the create.
+- Fixed: one failed manifest-change run no longer stops later manifest
+  changes from being processed.
+
 ## 0.0.29
 
 - Added: design element names may contain `/`, stored locally in subfolders

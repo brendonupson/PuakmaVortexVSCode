@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import {
+  DesignElement,
   DesignElementPayload,
   NewColumnPayload,
   NewDesignElementPayload,
   NewTablePayload,
   TornadoClient,
+  TornadoHttpError,
 } from "./tornadoClient";
 import {
   AGENT_INSTRUCTION_FILENAMES,
@@ -34,6 +36,12 @@ import { logError } from "./logging";
 // A change under here should be made through .tornado-manifest.json's
 // "dataconnections" section, not by hand-editing the dump directly.
 const DATA_CONNECTIONS_FOLDER = "DataConnections/";
+
+// False for a hand-written manifest entry that hasn't been created on the
+// server yet (see AppWatcher.findDraftEntry).
+function hasDesignBucketId(entry: ManifestEntry): boolean {
+  return typeof entry.designbucketid === "number";
+}
 
 // Every file beneath dir, as "/"-joined paths relative to it. A missing dir
 // is just empty.
@@ -86,6 +94,12 @@ export class AppWatcher implements vscode.Disposable {
   // ids back into it. Chaining every call onto this tail promise queues
   // them instead of letting two runs interleave against the same object.
   private manifestChangeQueue: Promise<void> = Promise.resolve();
+  // Creates in flight, by relative path. An external process writing a new
+  // file typically fires both onDidCreate and onDidChange, and both reach
+  // handleCreate() (handleChange() falls through to it for an untracked
+  // file) before the first create's server round trip has put an entry in
+  // the manifest — without this, each would create its own copy.
+  private readonly pendingCreates = new Map<string, Promise<void>>();
 
   constructor(
     readonly appFolder: vscode.Uri,
@@ -212,11 +226,10 @@ export class AppWatcher implements vscode.Disposable {
     }
 
     // Runs handleCreate() directly rather than through a live fs event, but
-    // handleCreate() still ends every create in persistManifest() (a real
+    // handleCreate() still ends every create in updateManifest() (a real
     // write to .tornado-manifest.json), and this watcher is already
-    // attached and listening by the time this runs — without suppressing,
-    // that write's own onDidChange would race handleManifestChange() against
-    // this loop's next handleCreate() over the same this.manifest object.
+    // attached and listening by the time this runs — suppressed so those
+    // writes don't each queue a redundant handleManifestChange().
     await this.runSuppressed(async () => {
       for (const candidate of candidates) {
         const uri = vscode.Uri.joinPath(this.appFolder, candidate.folderName, ...candidate.name.split("/"));
@@ -279,12 +292,45 @@ export class AppWatcher implements vscode.Disposable {
     return uri.path.startsWith(base) ? uri.path.slice(base.length) : undefined;
   }
 
+  // Only entries that are actually on the server (have a designbucketid) —
+  // see findDraftEntry() for the rest.
   private findEntry(relativePath: string): ManifestEntry | undefined {
-    return this.manifest.elements.find((entry) => entry.path === relativePath);
+    return this.manifest.elements.find((entry) => entry.path === relativePath && hasDesignBucketId(entry));
   }
 
+  // A hand-written manifest entry with no designbucketid yet — e.g. an AI
+  // agent adding a new file and an entry for it together. Not on the server,
+  // so it's treated as untracked; its properties seed the create instead.
+  private findDraftEntry(relativePath: string): ManifestEntry | undefined {
+    return this.manifest.elements.find((entry) => entry.path === relativePath && !hasDesignBucketId(entry));
+  }
+
+  // Only for writes made from inside handleManifestChange(), which already
+  // holds manifestChangeQueue — anything else goes through updateManifest().
   private async persistManifest(): Promise<void> {
     await writeManifestFile(this.appFolder, this.manifest);
+  }
+
+  // Applies one change to this.manifest and to the manifest on disk. Disk is
+  // re-read first rather than overwritten from memory, so an external edit
+  // made since it was last loaded (an agent writing the manifest alongside
+  // the file it just created) isn't clobbered — handleManifestChange() then
+  // picks that edit up from the change event this write fires. Queued with
+  // handleManifestChange() so neither can adopt or write a copy that's
+  // missing the other's change.
+  private updateManifest(mutate: (manifest: Manifest) => void): Promise<void> {
+    const run = this.manifestChangeQueue.then(async () => {
+      const onDisk = await readManifest(this.appFolder);
+      mutate(this.manifest);
+      if (onDisk && Array.isArray(onDisk.elements) && onDisk.appid === this.appid) {
+        mutate(onDisk);
+        await writeManifestFile(this.appFolder, onDisk);
+      } else {
+        await this.persistManifest();
+      }
+    });
+    this.manifestChangeQueue = run.catch(() => undefined);
+    return run;
   }
 
   // isJavaSourceUpload() also matches ".class" (a compiled artifact changing
@@ -308,8 +354,11 @@ export class AppWatcher implements vscode.Disposable {
   // Queues onto manifestChangeQueue rather than calling handleManifestChange()
   // directly — see the comment on that field.
   private queueManifestChange(): Promise<void> {
-    this.manifestChangeQueue = this.manifestChangeQueue.then(() => this.handleManifestChange());
-    return this.manifestChangeQueue;
+    const run = this.manifestChangeQueue.then(() => this.handleManifestChange());
+    // A failed run mustn't leave the queue rejected, or every later manifest
+    // change and update would be skipped along with it.
+    this.manifestChangeQueue = run.catch(() => undefined);
+    return run;
   }
 
   private async handleCreate(uri: vscode.Uri): Promise<void> {
@@ -390,41 +439,133 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
 
+    // Checked and set with no await in between, so two events for the
+    // same new file can't both get past this.
+    const pending = this.pendingCreates.get(relativePath);
+    if (pending) {
+      // Wait for the create already in flight, then upload whatever the
+      // file holds now — it may have been written again since.
+      await pending;
+      if (this.findEntry(relativePath)) {
+        return this.handleChange(uri);
+      }
+      return;
+    }
+    const creating = this.createOnServer(uri, relativePath, designtype, baseName, ext);
+    this.pendingCreates.set(relativePath, creating);
+    try {
+      await creating;
+    } finally {
+      this.pendingCreates.delete(relativePath);
+    }
+  }
+
+  private async createOnServer(
+    uri: vscode.Uri,
+    relativePath: string,
+    designtype: number,
+    baseName: string,
+    ext: string,
+  ): Promise<void> {
+    const draft = this.findDraftEntry(relativePath);
+    let payload: NewDesignElementPayload;
     try {
       const bytes = await vscode.workspace.fs.readFile(uri);
-      const contenttype = inferContentType(designtype, ext);
+      const contenttype = draft?.contenttype || inferContentType(designtype, ext);
       const base64 = Buffer.from(bytes).toString("base64");
       const useSource = useSourceField(designtype, contenttype);
-      const payload: NewDesignElementPayload = {
+      payload = {
         appid: this.appid,
         name: serverNameFor(baseName, ext, designtype),
         designtype,
         contenttype,
         designdata: useSource ? "" : base64,
         designsource: useSource ? base64 : "",
-        inheritfrom: null,
-        comment: "",
-        options: "",
-        designparams: [],
+        inheritfrom: draft?.inheritfrom ?? null,
+        comment: draft?.comment ?? "",
+        options: draft?.options ?? "",
+        designparams: draft?.designparams ?? [],
       };
-      const created = await this.client.createDesignElement(this.appid, payload);
-      this.manifest.elements.push({
-        path: relativePath,
-        designbucketid: created.designbucketid,
-        name: created.name,
-        designtype: created.designtype,
-        contenttype: created.contenttype,
-        inheritfrom: created.inheritfrom,
-        comment: created.comment,
-        options: created.options,
-        designparams: created.designparams,
+    } catch (error) {
+      vscode.window.showErrorMessage(`Failed to read "${relativePath}": ${(error as Error).message}`);
+      return;
+    }
+
+    let created: Partial<DesignElement> & { designbucketid: number };
+    try {
+      created = await this.client.createDesignElement(this.appid, payload);
+    } catch (error) {
+      const message = (error as Error).message;
+      const found = await this.findCreatedOnServer(payload);
+      if (!found) {
+        vscode.window.showErrorMessage(`Failed to create "${relativePath}" on the Tornado server: ${message}`);
+        return;
+      }
+      if (error instanceof TornadoHttpError) {
+        // The server refused the create, so the element it has under this
+        // name already existed (e.g. added by someone else, or dropped from
+        // the manifest earlier). Tracking it means the next save overwrites
+        // it with this file — confirm first.
+        const trackAction = "Track Existing";
+        const confirmed = await vscode.window.showWarningMessage(
+          `Couldn't create "${relativePath}" (${message}), but the server already has a design element named ` +
+            `"${payload.name}" (id ${found.designbucketid}). Track it as this file? Saving the file will then ` +
+            "overwrite the server's copy.",
+          { modal: true },
+          trackAction,
+        );
+        if (confirmed !== trackAction) {
+          this.output.appendLine(`Left "${relativePath}" untracked; "${payload.name}" on the server unchanged.`);
+          return;
+        }
+      } else {
+        // The request went through but its response couldn't be used (e.g.
+        // no designbucketid), or the connection dropped after sending — the
+        // element found is the one just created. Left out of the manifest,
+        // the next save of this file would create it again.
+        this.output.appendLine(
+          `Creating "${relativePath}" reported an error (${message}), but the server has it ` +
+            `(id ${found.designbucketid}) — tracking that.`,
+        );
+      }
+      created = found;
+    }
+
+    const entry: ManifestEntry = {
+      path: relativePath,
+      designbucketid: created.designbucketid,
+      name: created.name ?? payload.name,
+      designtype: created.designtype ?? payload.designtype,
+      contenttype: created.contenttype ?? payload.contenttype,
+      inheritfrom: created.inheritfrom ?? payload.inheritfrom,
+      comment: created.comment ?? payload.comment,
+      options: created.options ?? payload.options,
+      designparams: created.designparams ?? payload.designparams,
+    };
+    try {
+      await this.updateManifest((manifest) => {
+        // Replaces a draft entry for this path, if there was one.
+        manifest.elements = manifest.elements.filter((e) => e.path !== relativePath);
+        manifest.elements.push(entry);
       });
-      await this.persistManifest();
-      this.output.appendLine(`Created "${relativePath}" on the server (id ${created.designbucketid}).`);
+      this.output.appendLine(`Created "${relativePath}" on the server (id ${entry.designbucketid}).`);
     } catch (error) {
       vscode.window.showErrorMessage(
-        `Failed to create "${relativePath}" on the Tornado server: ${(error as Error).message}`,
+        `Created "${relativePath}" on the Tornado server (id ${entry.designbucketid}) but failed to record it ` +
+          `in ${MANIFEST_FILENAME}: ${(error as Error).message}`,
       );
+    }
+  }
+
+  private async findCreatedOnServer(payload: NewDesignElementPayload): Promise<DesignElement | undefined> {
+    try {
+      const design = await this.client.fetchApplicationDesign(this.appid);
+      const known = new Set(this.manifest.elements.filter(hasDesignBucketId).map((e) => e.designbucketid));
+      return design.designelements.find(
+        (e) => e.name === payload.name && e.designtype === payload.designtype && !known.has(e.designbucketid),
+      );
+    } catch {
+      return undefined;
     }
   }
 
@@ -486,12 +627,10 @@ export class AppWatcher implements vscode.Disposable {
   // diffManifestDataConnections() and applyDataConnectionsDiff() below for
   // why its deletions are confirmed rather than pushed silently.
   //
-  // The two other unsuppressed manifest writes in this class
-  // (handleCreate/handleDelete, via persistManifest()) are safe without any
-  // special-casing here: both mutate `this.manifest` in memory *before*
-  // writing it, so by the time the async fs event this method responds to
-  // is actually processed, `this.manifest` already matches what's on disk —
-  // the diff below comes out empty and this is a no-op.
+  // The other manifest writes in this class (create/delete, via
+  // updateManifest()) run on the same queue and update `this.manifest` as
+  // well as disk, so when their own change event is processed here the diff
+  // below comes out empty and this is a no-op.
   private async handleManifestChange(): Promise<void> {
     if (!vscode.workspace.getConfiguration("tornado").get<boolean>("pushLocalParameterEdits", true)) {
       return;
@@ -510,6 +649,10 @@ export class AppWatcher implements vscode.Disposable {
       );
       return;
     }
+
+    // Only kept if the identity check below passes — onDisk is discarded
+    // otherwise.
+    const restored = await this.restoreDroppedEntries(onDisk);
 
     const diff = diffManifestParams(this.appid, this.manifest, onDisk, this.output);
     if (!diff) {
@@ -537,6 +680,13 @@ export class AppWatcher implements vscode.Disposable {
     // designparams path below, since nothing here calls writeManifestFile;
     // applyDataConnectionsDiff() does, when it needs to.
     this.manifest = onDisk;
+    if (restored.length > 0) {
+      await this.persistManifest();
+      this.output.appendLine(
+        `${MANIFEST_FILENAME} was rewritten without ${restored.join(", ")} — restored, since the file(s) still ` +
+          "exist locally.",
+      );
+    }
 
     if (diff.appParams) {
       try {
@@ -564,6 +714,39 @@ export class AppWatcher implements vscode.Disposable {
     if (dcDiff) {
       await this.applyDataConnectionsDiff(dcDiff, applyRemovals);
     }
+  }
+
+  // An external process that rewrites the manifest from a copy it read
+  // earlier drops anything created on the server since — adopting that as-is
+  // would forget the element, and the next save of its file would create it
+  // on the server again. Puts back every entry this.manifest has (with a
+  // designbucketid) that onDisk lacks, as long as its file still exists,
+  // replacing a draft (id-less) entry at the same path. Returns the restored
+  // paths; mutates onDisk.
+  private async restoreDroppedEntries(onDisk: Manifest): Promise<string[]> {
+    const onDiskIds = new Set(onDisk.elements.filter(hasDesignBucketId).map((e) => e.designbucketid));
+    const restored: string[] = [];
+    for (const entry of this.manifest.elements) {
+      if (!hasDesignBucketId(entry) || onDiskIds.has(entry.designbucketid)) {
+        continue;
+      }
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.appFolder, ...entry.path.split("/")));
+      } catch {
+        continue;
+      }
+      const atPath = onDisk.elements.findIndex((e) => e.path === entry.path);
+      if (atPath >= 0 && hasDesignBucketId(onDisk.elements[atPath])) {
+        continue;
+      }
+      if (atPath >= 0) {
+        onDisk.elements[atPath] = entry;
+      } else {
+        onDisk.elements.push(entry);
+      }
+      restored.push(entry.path);
+    }
+    return restored;
   }
 
   private hasDataConnectionRemovals(diff: ManifestDataConnectionsDiff): boolean {
@@ -843,7 +1026,7 @@ export class AppWatcher implements vscode.Disposable {
       // Deleting a subfolder (e.g. Resources/css/) can surface as a single
       // event for the folder rather than one per file inside it.
       const prefix = `${relativePath}/`;
-      const nested = this.manifest.elements.filter((e) => e.path.startsWith(prefix));
+      const nested = this.manifest.elements.filter((e) => e.path.startsWith(prefix) && hasDesignBucketId(e));
       if (nested.length > 0) {
         await this.handleFolderDelete(relativePath, nested);
       }
@@ -867,8 +1050,9 @@ export class AppWatcher implements vscode.Disposable {
 
     try {
       await this.client.deleteDesignElement(this.appid, entry.designbucketid);
-      this.manifest.elements = this.manifest.elements.filter((e) => e.path !== relativePath);
-      await this.persistManifest();
+      await this.updateManifest((manifest) => {
+        manifest.elements = manifest.elements.filter((e) => e.designbucketid !== entry.designbucketid);
+      });
       this.output.appendLine(`Deleted "${entry.name}" from the server.`);
     } catch (error) {
       vscode.window.showErrorMessage(
@@ -876,6 +1060,7 @@ export class AppWatcher implements vscode.Disposable {
       );
     }
   }
+
   private async handleFolderDelete(relativePath: string, entries: ManifestEntry[]): Promise<void> {
     // A delete event can also fire for a folder that still exists (e.g. a
     // spurious event during an atomic rename) — only act on files that are
@@ -908,10 +1093,11 @@ export class AppWatcher implements vscode.Disposable {
       return;
     }
 
+    const deleted = new Set<number>();
     for (const entry of gone) {
       try {
         await this.client.deleteDesignElement(this.appid, entry.designbucketid);
-        this.manifest.elements = this.manifest.elements.filter((e) => e !== entry);
+        deleted.add(entry.designbucketid);
         this.output.appendLine(`Deleted "${entry.name}" from the server.`);
       } catch (error) {
         vscode.window.showErrorMessage(
@@ -919,6 +1105,10 @@ export class AppWatcher implements vscode.Disposable {
         );
       }
     }
-    await this.persistManifest();
+    if (deleted.size > 0) {
+      await this.updateManifest((manifest) => {
+        manifest.elements = manifest.elements.filter((e) => !deleted.has(e.designbucketid));
+      });
+    }
   }
 }

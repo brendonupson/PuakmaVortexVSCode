@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.31
+
+- Fixed: Java sources no longer fail to compile with "The package org.xml.sax
+  is accessible from more than one module: <unnamed>, java.xml" when a server
+  library jar (e.g. `xml-apis.jar`) contains packages the JDK also provides.
+  ecj now uses the JDK's copy of such packages, as javac does. This only
+  affected `javaVersion`/`tornado.javaRelease` 9 and above.
+- Changed: when the server's libraries contain the same jar in several
+  folders, or several versions of one library (e.g. `xmlbeans-2.3.0.jar` and
+  `xmlbeans-2.6.0.jar`), only one copy goes on the compile classpath: the
+  highest version. Skipped jars are listed in the Tornado output channel.
+  Entries in `tornado.compileClasspath` are always used as given.
+
 ## 0.0.30
 
 - Fixed: a design element created by the watcher (e.g. a new

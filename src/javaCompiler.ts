@@ -50,6 +50,18 @@ const ECJ_VERSION = "3.46.0";
 const ECJ_JAR_FILENAME = `ecj-${ECJ_VERSION}.jar`;
 const ECJ_DOWNLOAD_URL = `https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/${ECJ_VERSION}/${ECJ_JAR_FILENAME}`;
 
+// Compiler options passed to ecj via -properties. Server library zips
+// often carry old API jars (xml-apis, stax-api, jaxb-api, ...) whose
+// packages the JDK itself now provides as modules — e.g. org.xml.sax in
+// java.xml. With --release 9+ ecj, unlike javac, rejects any import of
+// such a package from code in the unnamed module: "The package org.xml.sax
+// is accessible from more than one module: <unnamed>, java.xml". This
+// option makes ecj ignore the classpath copy and use the JDK's, which is
+// what javac does and what the server sees at runtime. No effect on
+// --release 8, where there are no modules.
+const ECJ_PROPERTIES_FILENAME = "ecj.prefs";
+const ECJ_PROPERTIES = ["org.eclipse.jdt.core.compiler.ignoreUnnamedModuleForSplitPackage=enabled"];
+
 function findJava(): string {
   const configured = vscode.workspace.getConfiguration("tornado").get<string>("javaHome", "");
   const javaHome = configured || process.env.JAVA_HOME;
@@ -278,6 +290,94 @@ export async function ensureEcj(globalStorageUri: vscode.Uri, output: vscode.Out
   return jarUri.fsPath;
 }
 
+// Writes ECJ_PROPERTIES next to the ecj jar on every compile (cheap), so a
+// change to the options in a new extension version takes effect without
+// needing to clear global storage.
+async function ensureEcjProperties(globalStorageUri: vscode.Uri): Promise<string> {
+  const dir = vscode.Uri.joinPath(globalStorageUri, "ecj");
+  await vscode.workspace.fs.createDirectory(dir);
+  const propsUri = vscode.Uri.joinPath(dir, ECJ_PROPERTIES_FILENAME);
+  await vscode.workspace.fs.writeFile(propsUri, new TextEncoder().encode(ECJ_PROPERTIES.join("\n") + "\n"));
+  return propsUri.fsPath;
+}
+
+// Splits "xmlbeans-2.6.0" into artifact "xmlbeans" and version "2.6.0".
+// The version is the first "-<digit>..." suffix, so "commons-lang3-3.12.0"
+// and "bcprov-jdk15on-1.70" keep their whole artifact name. Undefined for
+// jars with no version in the name (e.g. "puakma").
+function splitJarVersion(baseName: string): { artifact: string; version: string } | undefined {
+  const match = /^(.+?)-(\d[\w.-]*)$/.exec(baseName);
+  return match ? { artifact: match[1].toLowerCase(), version: match[2] } : undefined;
+}
+
+// Compares versions segment by segment: numeric segments numerically (so
+// 2.10 > 2.9), anything else as text. A version that runs out of segments
+// first is older (2.6 < 2.6.1).
+function compareVersions(a: string, b: string): number {
+  const as = a.split(/[.\-_]/);
+  const bs = b.split(/[.\-_]/);
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    if (as[i] === undefined) {
+      return -1;
+    }
+    if (bs[i] === undefined) {
+      return 1;
+    }
+    const an = /^\d+$/.test(as[i]) ? parseInt(as[i], 10) : NaN;
+    const bn = /^\d+$/.test(bs[i]) ? parseInt(bs[i], 10) : NaN;
+    const diff = !isNaN(an) && !isNaN(bn) ? an - bn : as[i].localeCompare(bs[i]);
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+  return 0;
+}
+
+// The server's libraries zip can contain the same jar more than once (the
+// same file in two folders) or two versions of one library (e.g.
+// xmlbeans-2.3.0.jar and xmlbeans-2.6.0.jar). Both copies on the classpath
+// leave which classes the compiler sees down to classpath order, so this
+// keeps one jar per file name and, for versioned names, only the highest
+// version — at the position of that library's first occurrence, so
+// puakma.jar stays first. Every dropped jar is logged.
+export function dedupeJarClasspath(jars: string[], output: vscode.OutputChannel): string[] {
+  const kept: (string | undefined)[] = [];
+  const byFileName = new Map<string, number>();
+  const byArtifact = new Map<string, { index: number; version: string }>();
+  for (const jar of jars) {
+    const fileName = path.basename(jar).toLowerCase();
+    const sameFile = byFileName.get(fileName);
+    if (sameFile !== undefined) {
+      output.appendLine(`  classpath: skipping ${jar} (duplicate of ${kept[sameFile]})`);
+      continue;
+    }
+    const parsed = splitJarVersion(path.basename(jar, path.extname(jar)));
+    const sameArtifact = parsed && byArtifact.get(parsed.artifact);
+    if (parsed && sameArtifact) {
+      const previous = kept[sameArtifact.index]!;
+      if (compareVersions(parsed.version, sameArtifact.version) > 0) {
+        output.appendLine(`  classpath: using ${jar} instead of older ${previous}`);
+        byFileName.delete(path.basename(previous).toLowerCase());
+        kept[sameArtifact.index] = jar;
+        byFileName.set(fileName, sameArtifact.index);
+        sameArtifact.version = parsed.version;
+      } else {
+        output.appendLine(`  classpath: skipping ${jar} (older or same version as ${previous})`);
+        // Remembered so a later identical copy of this older jar is
+        // reported against the jar actually in use.
+        byFileName.set(fileName, sameArtifact.index);
+      }
+      continue;
+    }
+    byFileName.set(fileName, kept.length);
+    if (parsed) {
+      byArtifact.set(parsed.artifact, { index: kept.length, version: parsed.version });
+    }
+    kept.push(jar);
+  }
+  return kept.filter((jar): jar is string => jar !== undefined);
+}
+
 export interface CompileDiagnostic {
   fsPath: string;
   line: number; // 1-based, as ecj reports it
@@ -381,7 +481,9 @@ export async function compileApp(
   const serverClasspath = await ensureServerLibraries(tornadoRoot, appFolder, connectionId, client, output);
   const sharedCodeJars = await findSharedCodeJars(appFolder);
   const extraClasspath = vscode.workspace.getConfiguration("tornado").get<string[]>("compileClasspath", []);
-  const classpath = [...serverClasspath, ...sharedCodeJars, ...extraClasspath];
+  // tornado.compileClasspath is the user's own explicit list (and may hold
+  // directories), so it's appended as given rather than deduplicated.
+  const classpath = [...dedupeJarClasspath([...serverClasspath, ...sharedCodeJars], output), ...extraClasspath];
 
   const outDir = vscode.Uri.joinPath(appFolder, COMPILE_OUTPUT_FOLDER);
   // Cleared before every run rather than just created-if-missing: javac
@@ -407,10 +509,13 @@ export async function compileApp(
     output.appendLine(`Using javaVersion "${devConfig.javaVersion}" from ${DEV_CONFIG_RELATIVE_PATH}.`);
   }
   const ecjJar = await ensureEcj(globalStorageUri, output);
+  const ecjProperties = await ensureEcjProperties(globalStorageUri);
   const java = findJava();
   const args = [
     "-jar",
     ecjJar,
+    "-properties",
+    ecjProperties,
     "-d",
     outDir.fsPath,
     "-cp",

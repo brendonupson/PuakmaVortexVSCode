@@ -301,31 +301,34 @@ async function ensureEcjProperties(globalStorageUri: vscode.Uri): Promise<string
   return propsUri.fsPath;
 }
 
-// Splits "xmlbeans-2.6.0" into artifact "xmlbeans" and version "2.6.0".
-// The version is the first "-<digit>..." suffix, so "commons-lang3-3.12.0"
-// and "bcprov-jdk15on-1.70" keep their whole artifact name. Undefined for
-// jars with no version in the name (e.g. "puakma").
-function splitJarVersion(baseName: string): { artifact: string; version: string } | undefined {
-  const match = /^(.+?)-(\d[\w.-]*)$/.exec(baseName);
-  return match ? { artifact: match[1].toLowerCase(), version: match[2] } : undefined;
+// Maven's documentation/source attachment jars (itextpdf-5.5.1-javadoc.jar,
+// itextpdf-5.5.1-sources.jar) hold no compiled classes, so they never
+// belong on the compile classpath.
+const NON_CLASS_JAR_SUFFIX = /-(javadoc|sources|test-sources)$/i;
+
+// Splits "xmlbeans-2.6.0" into a library key "xmlbeans" and numeric version
+// "2.6.0". The version is the first "-<digits>(.<digits>)*" in the name, so
+// "commons-lang3-3.12.0" and "bcprov-jdk15on-1.70" keep their whole name as
+// the key. Anything after the version (a classifier or qualifier such as
+// "-jdk15" or "-SNAPSHOT") is part of the key, so only jars that differ
+// purely in version number count as versions of the same library.
+// Undefined for jars with no version in the name (e.g. "puakma").
+function splitJarVersion(baseName: string): { key: string; version: number[] } | undefined {
+  const match = /^(.+?)-(\d+(?:\.\d+)*)(.*)$/.exec(baseName);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    key: `${match[1]}|${match[3]}`.toLowerCase(),
+    version: match[2].split(".").map((part) => parseInt(part, 10)),
+  };
 }
 
-// Compares versions segment by segment: numeric segments numerically (so
-// 2.10 > 2.9), anything else as text. A version that runs out of segments
-// first is older (2.6 < 2.6.1).
-function compareVersions(a: string, b: string): number {
-  const as = a.split(/[.\-_]/);
-  const bs = b.split(/[.\-_]/);
-  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
-    if (as[i] === undefined) {
-      return -1;
-    }
-    if (bs[i] === undefined) {
-      return 1;
-    }
-    const an = /^\d+$/.test(as[i]) ? parseInt(as[i], 10) : NaN;
-    const bn = /^\d+$/.test(bs[i]) ? parseInt(bs[i], 10) : NaN;
-    const diff = !isNaN(an) && !isNaN(bn) ? an - bn : as[i].localeCompare(bs[i]);
+// Numeric, segment by segment (2.10 > 2.9); a missing segment counts as 0,
+// so 1.0 and 1.0.0 compare equal.
+function compareVersions(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
     if (diff !== 0) {
       return diff;
     }
@@ -339,20 +342,26 @@ function compareVersions(a: string, b: string): number {
 // leave which classes the compiler sees down to classpath order, so this
 // keeps one jar per file name and, for versioned names, only the highest
 // version — at the position of that library's first occurrence, so
-// puakma.jar stays first. Every dropped jar is logged.
+// puakma.jar stays first. -javadoc/-sources jars are left out entirely.
+// Every dropped jar is logged.
 export function dedupeJarClasspath(jars: string[], output: vscode.OutputChannel): string[] {
   const kept: (string | undefined)[] = [];
   const byFileName = new Map<string, number>();
-  const byArtifact = new Map<string, { index: number; version: string }>();
+  const byArtifact = new Map<string, { index: number; version: number[] }>();
   for (const jar of jars) {
+    const baseName = path.basename(jar, path.extname(jar));
+    if (NON_CLASS_JAR_SUFFIX.test(baseName)) {
+      output.appendLine(`  classpath: skipping ${jar} (javadoc/sources jar, no classes)`);
+      continue;
+    }
     const fileName = path.basename(jar).toLowerCase();
     const sameFile = byFileName.get(fileName);
     if (sameFile !== undefined) {
       output.appendLine(`  classpath: skipping ${jar} (duplicate of ${kept[sameFile]})`);
       continue;
     }
-    const parsed = splitJarVersion(path.basename(jar, path.extname(jar)));
-    const sameArtifact = parsed && byArtifact.get(parsed.artifact);
+    const parsed = splitJarVersion(baseName);
+    const sameArtifact = parsed && byArtifact.get(parsed.key);
     if (parsed && sameArtifact) {
       const previous = kept[sameArtifact.index]!;
       if (compareVersions(parsed.version, sameArtifact.version) > 0) {
@@ -371,7 +380,7 @@ export function dedupeJarClasspath(jars: string[], output: vscode.OutputChannel)
     }
     byFileName.set(fileName, kept.length);
     if (parsed) {
-      byArtifact.set(parsed.artifact, { index: kept.length, version: parsed.version });
+      byArtifact.set(parsed.key, { index: kept.length, version: parsed.version });
     }
     kept.push(jar);
   }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.32
+
+- Fixed: 0.0.31's jar deduplication treated `-javadoc`/`-sources` jars as
+  newer versions of a library (e.g. `itextpdf-5.5.1-sources.jar` replaced
+  `itextpdf-5.5.1.jar`), so its classes (`PdfWriter`, `BaseColor`, ...)
+  could not be resolved. Javadoc/sources jars are now left off the compile
+  classpath, and only jars whose names differ purely in version number are
+  treated as versions of the same library.
+
 ## 0.0.31
 
 - Fixed: Java sources no longer fail to compile with "The package org.xml.sax
